@@ -1,0 +1,2 @@
+linkerOpts.android = -L/Volumes/T7/code/github.com/mars/xlog-rs/target/armv7-linux-androideabi/debug/build/mars-xlog-sys-292e2f7dd626e70a/out -L/Volumes/T7/code/github.com/mars/xlog-rs/target/armv7-linux-androideabi/debug/build/mars-xlog-sys-292e2f7dd626e70a/out -lc++_shared -lstdc++ -lz -llog -landroid -ldl -llog -lunwind -ldl -lm -lc
+staticLibraries = libmars_xlog_uniffi.a

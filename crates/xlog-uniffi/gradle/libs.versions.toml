@@ -1,0 +1,290 @@
+[versions]
+# SDK / Toolchain
+androidCompileSdk = "36"
+androidTargetSdk = "34"
+androidMinSdk = "24"
+agp = "8.11.2"
+gradle = "8.13.1"
+kotlin = "2.2.0"
+jetbrainsKotlinJvm = "2.1.10"
+kotlinStdlib = "2.2.20"
+kotlinTest = "2.2.20"
+kotlinReflect = "2.2.0"
+symbolProcessing = "2.0.0-1.0.24"
+comGoogleDevtoolsKspGradlePlugin = "2.3.2"
+symbolProcessingApi = "2.1.21-2.0.2"
+kotlinpoetKsp = "2.2.0"
+
+# AndroidX / UI / Compose
+coreKtx = "1.17.0"
+activity = "1.11.0"
+activityCompose = "1.11.0"
+coreSplashscreen = "1.2.0"
+lifecycleRuntimeKtx = "2.9.4"
+lifecycleProcess = "2.9.4"
+lifecycleViewModelKtx = "2.9.4"
+fragmentKtx = "1.8.9"
+constraintlayout = "2.2.1"
+constraintlayoutCompose = "1.1.1"
+composeBom = "2025.11.00"
+composeMaterial = "1.9.4"
+material = "1.13.0"
+appcompat = "1.7.1"
+annotationJvm = "1.9.1"
+startupRuntime = "1.2.0"
+androidxWork = "2.11.0"
+runner = "1.7.0"
+coreVersion = "1.7.0"
+
+# Networking / Serialization
+loggingInterceptor = "5.3.2"
+kotlinxSerializationJson = "1.9.0"
+
+# Concurrency
+kotlinxCoroutinesAndroidVersion = "1.10.2"
+
+# DI
+hilt = "2.57.2"
+hiltExt = "1.3.0"
+
+# Storage / DB
+room = "2.8.3"
+mmkv = "2.2.4"
+wcdbAndroid = "1.1-19"
+
+# Media / UI libs
+exoplayer = "2.19.1"
+androidautosize = "v1.2.1"
+floatingx = "2.3.7"
+gestureUiCore = "0.0.1-dev"
+biometric = "1.1.0"
+webkit = "1.14.0"
+
+# Security / Device
+soterWrapper = "2.1.8"
+offliceFingerprint = "1.0.0"
+wechatSdkAndroid = "6.8.30"
+normal = "4.2.18"
+
+# Observability / Performance
+runtimeTracingVersion = "1.9.4"
+tracing = "1.3.0"
+tracingPerfettoVersion = "1.0.0"
+tracingPerfettoBinary = "1.0.0"
+blockcanaryAndroid = "1.5.0"
+blockcanaryNoOp = "1.5.0"
+leakcanaryAndroid = "2.14"
+
+# Messaging / Analytics / Push
+tpns = "1.4.4.2-release"
+wa = "2.1.21"
+crashreport = "4.1.9.3"
+
+# Hybrid / Web
+core = "7.4.4"
+
+# Utility
+autoService = "1.1.1"
+processPhoenix = "3.0.0"
+zip4j = "2.11.5"
+junit = "4.13.2"
+junitVersion = "1.3.0"
+espressoCore = "3.7.0"
+robolectric = "4.16"
+buildLogic = "0.1.0-SNAPSHOT"
+
+[libraries]
+# AndroidX 基础 & 平台
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "appcompat" }
+androidx-activity = { group = "androidx.activity", name = "activity", version.ref = "activity" }
+androidx-fragment-ktx = { module = "androidx.fragment:fragment-ktx", version.ref = "fragmentKtx" }
+androidx-constraintlayout = { group = "androidx.constraintlayout", name = "constraintlayout", version.ref = "constraintlayout" }
+androidx-core-splashscreen = { module = "androidx.core:core-splashscreen", version.ref = "coreSplashscreen" }
+androidx-annotation-jvm = { group = "androidx.annotation", name = "annotation-jvm", version.ref = "annotationJvm" }
+androidx-startup-runtime = { module = "androidx.startup:startup-runtime", version.ref = "startupRuntime" }
+androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycleRuntimeKtx" }
+androidx-lifecycle-process = { group = "androidx.lifecycle", name = "lifecycle-process", version.ref = "lifecycleProcess" }
+androidx-lifecycle-viewmodel-ktx = { group = "androidx.lifecycle", name = "lifecycle-viewmodel-ktx", version.ref = "lifecycleViewModelKtx" }
+androidx-work-runtime-ktx = { module = "androidx.work:work-runtime-ktx", version.ref = "androidxWork" }
+androidautosize = { module = "com.github.JessYanCoding:AndroidAutoSize", version.ref = "androidautosize" }
+androidx-webkit = { module = "androidx.webkit:webkit", version.ref = "webkit" }
+androidx-material = { group = "com.google.android.material", name = "material", version.ref = "material" }
+
+# Compose 相关
+androidx-compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
+androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
+androidx-ui = { group = "androidx.compose.ui", name = "ui" }
+androidx-ui-graphics = { group = "androidx.compose.ui", name = "ui-graphics" }
+androidx-ui-tooling = { group = "androidx.compose.ui", name = "ui-tooling" }
+androidx-ui-tooling-preview = { group = "androidx.compose.ui", name = "ui-tooling-preview" }
+androidx-material3 = { group = "androidx.compose.material3", name = "material3" }
+compose-material = { module = "androidx.compose.material:material", version.ref = "composeMaterial" }
+androidx-constraintlayout-compose = { group = "androidx.constraintlayout", name = "constraintlayout-compose", version.ref = "constraintlayoutCompose" }
+androidx-ui-test-manifest = { group = "androidx.compose.ui", name = "ui-test-manifest" }
+androidx-ui-test-junit4 = { group = "androidx.compose.ui", name = "ui-test-junit4" }
+
+# Kotlin / 协程
+jetbrains-kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "kotlinxCoroutinesAndroidVersion" }
+kotlin-reflect = { module = "org.jetbrains.kotlin:kotlin-reflect", version.ref = "kotlinReflect" }
+kotlin-stdlib = { group = "org.jetbrains.kotlin", name = "kotlin-stdlib", version.ref = "kotlinStdlib" }
+kotlin-test = { group = "org.jetbrains.kotlin", name = "kotlin-test", version.ref = "kotlinTest" }
+
+# 网络 / 序列化
+okhttp = { module = "com.squareup.okhttp3:okhttp", version.ref = "loggingInterceptor" }
+logging-interceptor = { module = "com.squareup.okhttp3:logging-interceptor", version.ref = "loggingInterceptor" }
+kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinxSerializationJson" }
+
+# DI
+hilt-android = { group = "com.google.dagger", name = "hilt-android", version.ref = "hilt" }
+hilt-compiler = { group = "com.google.dagger", name = "hilt-compiler", version.ref = "hilt" }
+hilt-ext-compiler = { group = "androidx.hilt", name = "hilt-compiler", version.ref = "hiltExt" }
+javax-inject = { group = "javax.inject", name = "javax.inject", version = "1" }
+
+# 存储 / DB
+room-runtime = { group = "androidx.room", name = "room-runtime", version.ref = "room" }
+room-ktx = { group = "androidx.room", name = "room-ktx", version.ref = "room" }
+room-compiler = { group = "androidx.room", name = "room-compiler", version.ref = "room" }
+mmkv = { module = "com.tencent:mmkv", version.ref = "mmkv" }
+ui-gesture-ui-core = { module = "com.webank.gesture.ui:gesture-ui-core" }
+wcdb-android = { module = "com.tencent.wcdb:wcdb-android", version.ref = "wcdbAndroid" }
+
+# 媒体 / Hybrid / 交互
+exoplayer = { module = "com.google.android.exoplayer:exoplayer", version.ref = "exoplayer" }
+capacitor-core = { module = "com.capacitorjs:core", version.ref = "core" }
+gesture-mpp = { module = "com.webank.gesture:gesture-mpp", version = "0.0.1-dev" }
+gesture-ui-core = { module = "com.webank.gesture.ui:gesture-ui-core", version.ref = "gestureUiCore" }
+floatingx = { module = "io.github.petterpx:floatingx", version.ref = "floatingx" }
+
+# 安全 / 终端
+wechat-sdk-android = { module = "com.tencent.mm.opensdk:wechat-sdk-android", version.ref = "wechatSdkAndroid" }
+soter-wrapper = { module = "com.github.Tencent.soter:soter-wrapper", version.ref = "soterWrapper" }
+offlice-fingerprint = { module = "com.webank:offlice-fingerprint", version.ref = "offliceFingerprint" }
+normal = { module = "com.webank.dram:normal", version.ref = "normal" }
+androidx-biometric = { module = "androidx.biometric:biometric", version.ref = "biometric" }
+
+# 观测 / 性能
+runtime-tracing = { module = "androidx.compose.runtime:runtime-tracing", version.ref = "runtimeTracingVersion" }
+tracing-perfetto = { module = "androidx.tracing:tracing-perfetto", version.ref = "tracingPerfettoVersion" }
+androidx-tracing-perfetto-binary = { module = "androidx.tracing:tracing-perfetto-binary", version.ref = "tracingPerfettoBinary" }
+androidx-tracing = { module = "androidx.tracing:tracing", version.ref = "tracing" }
+blockcanary-debug = { module = "com.github.markzhai:blockcanary-android", version.ref = "blockcanaryAndroid" }
+blockcanary-no-op = { module = "com.github.markzhai:blockcanary-no-op", version.ref = "blockcanaryNoOp" }
+leakcanary-android = { module = "com.squareup.leakcanary:leakcanary-android", version.ref = "leakcanaryAndroid" }
+
+# 推送 / 分析
+tpns = { module = "com.tencent.tpns:tpns", version.ref = "tpns" }
+crashreport = { module = "com.tencent.bugly:crashreport", version.ref = "crashreport" }
+wa = { module = "com.webank.dram:WA", version.ref = "wa" }
+
+# 构建 / 编译器
+gradle = { module = "com.android.tools.build:gradle", version.ref = "gradle" }
+com-google-devtools-ksp-gradle-plugin = { module = "com.google.devtools.ksp:com.google.devtools.ksp.gradle.plugin", version.ref = "comGoogleDevtoolsKspGradlePlugin" }
+symbol-processing = { module = "com.google.devtools.ksp:symbol-processing", version.ref = "symbolProcessing" }
+symbol-processing-api = { module = "com.google.devtools.ksp:symbol-processing-api", version.ref = "symbolProcessingApi" }
+kotlinpoet-ksp = { module = "com.squareup:kotlinpoet-ksp", version.ref = "kotlinpoetKsp" }
+auto-service = { module = "com.google.auto.service:auto-service", version.ref = "autoService" }
+
+# 工具 / 杂项
+process-phoenix = { module = "com.jakewharton:process-phoenix", version.ref = "processPhoenix" }
+zip4j = { module = "net.lingala.zip4j:zip4j", version.ref = "zip4j" }
+
+# 测试 / Mock
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junitVersion" }
+androidx-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espressoCore" }
+robolectric = { group = "org.robolectric", name = "robolectric", version.ref = "robolectric" }
+androidx-runner = { group = "androidx.test", name = "runner", version.ref = "runner" }
+androidx-core = { group = "androidx.test", name = "core", version.ref = "coreVersion" }
+mockito-core = { group = "org.mockito", name = "mockito-core", version = "5.11.0" }
+mockito-kotlin = { group = "org.mockito.kotlin", name = "mockito-kotlin", version = "5.2.1" }
+
+# 内部 build-logic 依赖
+build-logic-ksp-annotation = { module = "com.webank.dram:kspannotation", version.ref = "buildLogic" }
+build-logic-ksp-processor = { module = "com.webank.dram:kspprocessor", version.ref = "buildLogic" }
+build-logic-kapt-processor = { module = "com.webank.dram:kaptprocessor", version.ref = "buildLogic" }
+
+[bundles]
+
+# AndroidX 核心依赖
+androidx-core = [
+    "androidx-core-ktx",
+    "androidx-appcompat",
+    "androidx-activity"
+]
+
+# Compose UI 核心
+compose-ui = [
+    "androidx-ui",
+    "androidx-ui-graphics",
+    "androidx-ui-tooling-preview",
+    "androidx-material3"
+]
+
+# Compose Debug 工具
+compose-debug = [
+    "androidx-ui-tooling",
+    "androidx-ui-test-manifest"
+]
+
+# Lifecycle 组件
+androidx-lifecycle = [
+    "androidx-lifecycle-runtime-ktx",
+    "androidx-lifecycle-viewmodel-ktx",
+    "androidx-lifecycle-process"
+]
+
+# 协程
+coroutines = [
+    "jetbrains-kotlinx-coroutines-android"
+]
+
+# 网络请求
+networking = [
+    "okhttp",
+    "logging-interceptor"
+]
+
+# Hilt 依赖注入
+hilt-di = [
+    "hilt-android"
+]
+
+# 单元测试
+testing-unit = [
+    "junit",
+    "mockito-core",
+    "mockito-kotlin",
+    "kotlin-test"
+]
+
+# Android 测试
+testing-android = [
+    "androidx-junit",
+    "androidx-espresso-core",
+    "androidx-runner",
+    "androidx-core"
+]
+
+
+[plugins]
+
+android-application = { id = "com.android.application", version.ref = "agp" }
+
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
+
+jetbrains-kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "jetbrainsKotlinJvm" }
+
+android-library = { id = "com.android.library", version.ref = "agp" }
+
+jetbrains-kotlin-kapt = { id = "org.jetbrains.kotlin.kapt", version.ref = "kotlin" }
+
+hilt = { id = "com.google.dagger.hilt.android", version.ref = "hilt" }
+google-ksp = { id = "com.google.devtools.ksp", version.ref = "comGoogleDevtoolsKspGradlePlugin" }
+kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
+android-kotlin-multiplatform-library = { id = "com.android.kotlin.multiplatform.library", version.ref = "agp" }
+android-lint = { id = "com.android.lint", version.ref = "agp" }

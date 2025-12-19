@@ -1,0 +1,8 @@
+com.tencent.mars.xlog-jetified-jna-5.18.1-0 /Users/fannnzhang/.gradle/caches/8.14.3/transforms/483de5bfb2e785bb3af498fd21453f3d/transformed/jetified-jna-5.18.1/res
+com.tencent.mars.xlog-pngs-1 /Volumes/T7/code/github.com/mars/xlog-rs/crates/xlog-uniffi/build/generated/res/pngs/release
+com.tencent.mars.xlog-resValues-2 /Volumes/T7/code/github.com/mars/xlog-rs/crates/xlog-uniffi/build/generated/res/resValues/release
+com.tencent.mars.xlog-mergeReleaseResources-3 /Volumes/T7/code/github.com/mars/xlog-rs/crates/xlog-uniffi/build/intermediates/incremental/release/mergeReleaseResources/merged.dir
+com.tencent.mars.xlog-mergeReleaseResources-4 /Volumes/T7/code/github.com/mars/xlog-rs/crates/xlog-uniffi/build/intermediates/incremental/release/mergeReleaseResources/stripped.dir
+com.tencent.mars.xlog-release-5 /Volumes/T7/code/github.com/mars/xlog-rs/crates/xlog-uniffi/build/intermediates/merged_res/release/mergeReleaseResources
+com.tencent.mars.xlog-main-6 /Volumes/T7/code/github.com/mars/xlog-rs/crates/xlog-uniffi/src/main/res
+com.tencent.mars.xlog-release-7 /Volumes/T7/code/github.com/mars/xlog-rs/crates/xlog-uniffi/src/release/res

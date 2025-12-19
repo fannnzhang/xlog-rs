@@ -1,0 +1,20 @@
+[package]
+name = "mars-xlog"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+libc = { workspace = true }
+thiserror = { workspace = true }
+mars-xlog-sys = { path = "../xlog-sys" }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"], optional = true }
+
+[features]
+# 控制是否启用 Rust 侧便捷宏
+macros = []
+tracing = ["dep:tracing", "dep:tracing-subscriber"]

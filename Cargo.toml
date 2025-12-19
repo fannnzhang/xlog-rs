@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/xlog-sys",
+    "crates/xlog",
+    "crates/xlog-uniffi",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Tencent/mars"
+
+[workspace.dependencies]
+libc = "0.2"
+thiserror = "1"

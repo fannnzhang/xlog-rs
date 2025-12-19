@@ -1,0 +1,13 @@
+[package]
+name = "mars-xlog-sys"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+links = "mars_xlog"
+build = "build.rs"
+
+[dependencies]
+libc = { workspace = true }
+
+[build-dependencies]
+cc = "1"

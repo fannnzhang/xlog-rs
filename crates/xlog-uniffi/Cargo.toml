@@ -1,0 +1,13 @@
+[package]
+name = "mars-xlog-uniffi"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+mars-xlog = { path = "../xlog" }
+thiserror = { workspace = true }
+uniffi = "0.29.5"
