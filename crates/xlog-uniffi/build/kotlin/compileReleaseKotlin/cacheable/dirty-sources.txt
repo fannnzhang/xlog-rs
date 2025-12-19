@@ -1,2 +1,0 @@
-/Volumes/T7/code/github.com/mars/xlog-rs/crates/xlog-uniffi/build/generated/uniffi/main/kotlin/uniffi/xlog/xlog.common.kt
-/Volumes/T7/code/github.com/mars/xlog-rs/crates/xlog-uniffi/build/generated/uniffi/main/kotlin/uniffi/xlog/xlog.android.kt

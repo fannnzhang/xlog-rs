@@ -3,3 +3,6 @@ target/
 .DS_Store
 .idea/
 .vscode/
+crates/xlog-uniffi/.gradle/
+crates/xlog-uniffi/build/
+crates/xlog-uniffi/gradle/wrapper/gradle-*.zip
