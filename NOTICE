@@ -1,7 +1,7 @@
 Third-Party Notices
 ===================
 
-This project vendors Tencent Mars as a git subtree at:
+This project uses Tencent Mars as a git submodule at:
   third_party/mars
 
 Tencent Mars is licensed under the MIT License, with additional third-party

@@ -15,18 +15,20 @@ This workspace provides Rust bindings for Tencent Mars `xlog` using a C ABI wrap
 - Android: links `log` + `android`.
 - Harmony/ohos: links `hilog` (adjust if your toolchain differs).
 
-## Mars subtree
-This repository vendors Tencent Mars as a git subtree at `third_party/mars`.
+## Mars submodule
+This repository uses Tencent Mars as a git submodule at `third_party/mars`.
 The build uses `third_party/mars/mars` (the Mars repo's `mars/` directory).
 
-Update the subtree:
+Initialize the submodule (first time):
 ```bash
-git subtree pull --prefix third_party/mars https://github.com/Tencent/mars.git master --squash
+git submodule update --init --recursive
 ```
 
-Add the subtree (first time):
+Update the submodule to a newer commit:
 ```bash
-git subtree add --prefix third_party/mars https://github.com/Tencent/mars.git master --squash
+git -C third_party/mars fetch
+git -C third_party/mars checkout <tag-or-commit>
+git add third_party/mars
 ```
 
 ## Example (Rust)

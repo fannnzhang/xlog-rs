@@ -1,0 +1,3 @@
+[submodule "third_party/mars"]
+	path = third_party/mars
+	url = https://github.com/Tencent/mars.git

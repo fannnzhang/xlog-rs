@@ -7,12 +7,14 @@ Thanks for your interest in improving mars-xlog.
 - Run tests with `cargo test` where applicable.
 - If you touch native build logic, mention the toolchains you used in the PR.
 
-## Updating the Mars subtree
-This repo vendors Tencent Mars via git subtree at `third_party/mars`.
+## Updating the Mars submodule
+This repo uses Tencent Mars as a git submodule at `third_party/mars`.
 Use the following to update it:
 
 ```bash
-git subtree pull --prefix third_party/mars https://github.com/Tencent/mars.git master --squash
+git -C third_party/mars fetch
+git -C third_party/mars checkout <tag-or-commit>
+git add third_party/mars
 ```
 
 ## Reporting issues
