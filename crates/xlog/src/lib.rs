@@ -1,3 +1,22 @@
+//! Safe Rust wrapper for the Tencent Mars Xlog logging library.
+//!
+//! This crate owns the high-level API used by the platform bindings. It wraps
+//! the raw FFI in `mars-xlog-sys` and provides an ergonomic `Xlog` handle plus
+//! helpers for `tracing`.
+//!
+//! # Quick start
+//! ```
+//! use mars_xlog::{LogLevel, Xlog, XlogConfig};
+//!
+//! let cfg = XlogConfig::new("/tmp/xlog", "demo");
+//! let logger = Xlog::init(cfg, LogLevel::Info).expect("init xlog");
+//! logger.log(LogLevel::Info, None, "hello from rust");
+//! logger.flush(true);
+//! ```
+//!
+//! # Feature flags
+//! - `macros`: `xlog!` and level helpers that capture file/module/line.
+//! - `tracing`: `XlogLayer` for `tracing-subscriber`.
 use libc::{c_char, c_int, gettimeofday, timeval};
 use mars_xlog_sys as sys;
 use std::ffi::{CStr, CString};
@@ -10,6 +29,7 @@ mod tracing_layer;
 #[cfg(feature = "tracing")]
 pub use tracing_layer::{XlogLayer, XlogLayerConfig, XlogLayerHandle};
 
+/// Log severity levels supported by Mars Xlog.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum LogLevel {
     Verbose,
@@ -35,6 +55,7 @@ impl LogLevel {
     }
 }
 
+/// Controls whether logs are appended asynchronously or synchronously.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum AppenderMode {
     Async,
@@ -50,6 +71,7 @@ impl AppenderMode {
     }
 }
 
+/// Compression algorithm used for log buffers/files.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum CompressMode {
     Zlib,
@@ -65,6 +87,7 @@ impl CompressMode {
     }
 }
 
+/// Result code returned by `Xlog::oneshot_flush`.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum FileIoAction {
     None,
@@ -92,6 +115,7 @@ impl From<c_int> for FileIoAction {
     }
 }
 
+/// Errors returned by Xlog initialization helpers.
 #[derive(Debug, thiserror::Error)]
 pub enum XlogError {
     #[error("log_dir and name_prefix must be non-empty")]
@@ -100,19 +124,29 @@ pub enum XlogError {
     InitFailed,
 }
 
+/// Configuration used to create an Xlog instance or open the global appender.
 #[derive(Debug, Clone)]
 pub struct XlogConfig {
+    /// Directory for log files. Must be non-empty.
     pub log_dir: String,
+    /// Prefix for log file names and the instance name. Must be non-empty.
     pub name_prefix: String,
+    /// Optional public key (hex string, 128 chars) enabling log encryption.
     pub pub_key: Option<String>,
+    /// Optional cache directory for mmap buffers and temporary logs.
     pub cache_dir: Option<String>,
+    /// Days to keep cached logs before moving them to `log_dir`.
     pub cache_days: i32,
+    /// Appender mode (async or sync).
     pub mode: AppenderMode,
+    /// Compression algorithm for log buffers/files.
     pub compress_mode: CompressMode,
+    /// Compression level forwarded to the compressor.
     pub compress_level: i32,
 }
 
 impl XlogConfig {
+    /// Create a config with required fields and sensible defaults.
     pub fn new(log_dir: impl Into<String>, name_prefix: impl Into<String>) -> Self {
         Self {
             log_dir: log_dir.into(),
@@ -126,31 +160,37 @@ impl XlogConfig {
         }
     }
 
+    /// Set the public key used to encrypt logs.
     pub fn pub_key(mut self, key: impl Into<String>) -> Self {
         self.pub_key = Some(key.into());
         self
     }
 
+    /// Set the optional cache directory for mmap buffers and temp files.
     pub fn cache_dir(mut self, dir: impl Into<String>) -> Self {
         self.cache_dir = Some(dir.into());
         self
     }
 
+    /// Set the number of days to keep cached logs before moving them.
     pub fn cache_days(mut self, days: i32) -> Self {
         self.cache_days = days;
         self
     }
 
+    /// Set the appender mode.
     pub fn mode(mut self, mode: AppenderMode) -> Self {
         self.mode = mode;
         self
     }
 
+    /// Set the compression algorithm.
     pub fn compress_mode(mut self, mode: CompressMode) -> Self {
         self.compress_mode = mode;
         self
     }
 
+    /// Set the compression level forwarded to the compressor.
     pub fn compress_level(mut self, level: i32) -> Self {
         self.compress_level = level;
         self
@@ -175,16 +215,20 @@ impl XlogConfig {
             mode: self.mode.as_sys() as c_int,
             logdir: log_dir,
             nameprefix: name_prefix,
-            pub_key: pub_key,
+            pub_key,
             compress_mode: self.compress_mode.as_sys() as c_int,
             compress_level: self.compress_level as c_int,
-            cache_dir: cache_dir,
+            cache_dir,
             cache_days: self.cache_days as c_int,
         };
         (cfg, cstrings)
     }
 }
 
+/// Handle to a Mars Xlog instance.
+///
+/// Cloning the handle is cheap; the underlying instance is reference-counted
+/// and released when the last handle is dropped.
 #[derive(Clone)]
 pub struct Xlog {
     inner: Arc<Inner>,
@@ -197,7 +241,8 @@ struct Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        let name = CString::new(self.name_prefix.clone()).unwrap_or_else(|_| CString::new("xlog").unwrap());
+        let name = CString::new(self.name_prefix.clone())
+            .unwrap_or_else(|_| CString::new("xlog").unwrap());
         unsafe {
             sys::mars_xlog_release_instance(name.as_ptr());
         }
@@ -205,6 +250,12 @@ impl Drop for Inner {
 }
 
 impl Xlog {
+    /// Initialize a new Xlog instance (recommended entrypoint).
+    pub fn init(config: XlogConfig, level: LogLevel) -> Result<Self, XlogError> {
+        Self::new(config, level)
+    }
+
+    #[doc(hidden)]
     pub fn new(config: XlogConfig, level: LogLevel) -> Result<Self, XlogError> {
         if config.log_dir.is_empty() || config.name_prefix.is_empty() {
             return Err(XlogError::InvalidConfig);
@@ -222,6 +273,7 @@ impl Xlog {
         })
     }
 
+    /// Look up an existing instance by name prefix.
     pub fn get(name_prefix: &str) -> Option<Self> {
         let name = CString::new(name_prefix).ok()?;
         let instance = unsafe { sys::mars_xlog_get_instance(name.as_ptr()) };
@@ -236,6 +288,7 @@ impl Xlog {
         })
     }
 
+    #[doc(hidden)]
     pub fn appender_open(config: XlogConfig, level: LogLevel) -> Result<(), XlogError> {
         if config.log_dir.is_empty() || config.name_prefix.is_empty() {
             return Err(XlogError::InvalidConfig);
@@ -247,32 +300,44 @@ impl Xlog {
         Ok(())
     }
 
+    #[doc(hidden)]
     pub fn appender_close() {
         unsafe {
             sys::mars_xlog_appender_close();
         }
     }
 
+    #[doc(hidden)]
     pub fn flush_all(sync: bool) {
         unsafe {
             sys::mars_xlog_flush_all(if sync { 1 } else { 0 });
         }
     }
 
+    #[cfg(any(
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "watchos"
+    ))]
+    #[doc(hidden)]
     pub fn set_console_fun(fun: ConsoleFun) {
         unsafe {
             sys::mars_xlog_set_console_fun(fun as c_int);
         }
     }
 
+    /// Returns the raw instance handle used by the underlying C++ library.
     pub fn instance(&self) -> usize {
         self.inner.instance
     }
 
+    /// Returns `true` if logs at `level` are enabled for this instance.
     pub fn is_enabled(&self, level: LogLevel) -> bool {
         unsafe { sys::mars_xlog_is_enabled(self.inner.instance, level.as_sys() as c_int) != 0 }
     }
 
+    /// Get the current log level for this instance.
     pub fn level(&self) -> LogLevel {
         match unsafe { sys::mars_xlog_get_level(self.inner.instance) } {
             0 => LogLevel::Verbose,
@@ -285,49 +350,73 @@ impl Xlog {
         }
     }
 
+    /// Set the minimum log level for this instance.
     pub fn set_level(&self, level: LogLevel) {
         unsafe {
             sys::mars_xlog_set_level(self.inner.instance, level.as_sys() as c_int);
         }
     }
 
+    /// Switch between async and sync appender modes.
     pub fn set_appender_mode(&self, mode: AppenderMode) {
         unsafe {
             sys::mars_xlog_set_appender_mode(self.inner.instance, mode.as_sys() as c_int);
         }
     }
 
+    /// Flush buffered logs for this instance.
     pub fn flush(&self, sync: bool) {
         unsafe {
             sys::mars_xlog_flush(self.inner.instance, if sync { 1 } else { 0 });
         }
     }
 
+    /// Enable or disable console logging (platform dependent).
     pub fn set_console_log_open(&self, open: bool) {
         unsafe {
             sys::mars_xlog_set_console_log_open(self.inner.instance, if open { 1 } else { 0 });
         }
     }
 
+    /// Set the max log file size in bytes (0 disables splitting).
     pub fn set_max_file_size(&self, max_bytes: i64) {
         unsafe {
             sys::mars_xlog_set_max_file_size(self.inner.instance, max_bytes as _);
         }
     }
 
+    /// Set the max log file age in seconds before deletion/rotation.
     pub fn set_max_alive_time(&self, alive_seconds: i64) {
         unsafe {
             sys::mars_xlog_set_max_alive_time(self.inner.instance, alive_seconds as _);
         }
     }
 
+    /// Log a message with caller file/line captured via `#[track_caller]`.
+    ///
+    /// Note: function name is not available here; use `xlog!` macro or
+    /// `write_with_meta` when you need full metadata.
+    #[track_caller]
+    pub fn log(&self, level: LogLevel, tag: Option<&str>, msg: impl AsRef<str>) {
+        if !self.is_enabled(level) {
+            return;
+        }
+        let loc = std::panic::Location::caller();
+        self.write_with_meta(level, tag, loc.file(), "", loc.line(), msg.as_ref());
+    }
+
+    /// Compatibility wrapper for older APIs. Prefer `log` or the macros.
+    #[track_caller]
     pub fn write(&self, level: LogLevel, tag: Option<&str>, msg: &str) {
         if !self.is_enabled(level) {
             return;
         }
-        self.write_with_meta(level, tag, file!(), module_path!(), line!(), msg);
+        self.write_with_meta(level, tag, "", "", 0, msg);
     }
 
+    /// Log with explicit metadata (file, function, line).
+    ///
+    /// Use this when callers already provide metadata (for example from JNI).
     pub fn write_with_meta(
         &self,
         level: LogLevel,
@@ -342,9 +431,7 @@ impl Xlog {
         }
 
         let mut cstrings = Vec::new();
-        let tag_ptr = tag
-            .unwrap_or(&self.inner.name_prefix)
-            .to_string();
+        let tag_ptr = tag.unwrap_or(&self.inner.name_prefix).to_string();
         let tag_c = to_cstring(&tag_ptr, &mut cstrings);
         let file_c = to_cstring(file, &mut cstrings);
         let func_c = to_cstring(func, &mut cstrings);
@@ -373,26 +460,36 @@ impl Xlog {
         }
     }
 
+    #[doc(hidden)]
     pub fn current_log_path() -> Option<String> {
         read_path(|buf, len| unsafe { sys::mars_xlog_get_current_log_path(buf, len) })
     }
 
+    #[doc(hidden)]
     pub fn current_log_cache_path() -> Option<String> {
         read_path(|buf, len| unsafe { sys::mars_xlog_get_current_log_cache_path(buf, len) })
     }
 
+    #[doc(hidden)]
     pub fn filepaths_from_timespan(timespan: i32, prefix: &str) -> Vec<String> {
         read_joined(|buf, len| unsafe {
-            sys::mars_xlog_get_filepath_from_timespan(timespan, cstr_or_null(prefix).as_ptr(), buf, len)
+            sys::mars_xlog_get_filepath_from_timespan(
+                timespan,
+                cstr_or_null(prefix).as_ptr(),
+                buf,
+                len,
+            )
         })
     }
 
+    #[doc(hidden)]
     pub fn make_logfile_name(timespan: i32, prefix: &str) -> Vec<String> {
         read_joined(|buf, len| unsafe {
             sys::mars_xlog_make_logfile_name(timespan, cstr_or_null(prefix).as_ptr(), buf, len)
         })
     }
 
+    #[doc(hidden)]
     pub fn oneshot_flush(config: XlogConfig) -> Result<FileIoAction, XlogError> {
         if config.log_dir.is_empty() || config.name_prefix.is_empty() {
             return Err(XlogError::InvalidConfig);
@@ -406,6 +503,7 @@ impl Xlog {
         Ok(FileIoAction::from(action))
     }
 
+    #[doc(hidden)]
     pub fn dump(buffer: &[u8]) -> String {
         if buffer.is_empty() {
             return String::new();
@@ -416,6 +514,7 @@ impl Xlog {
         }
     }
 
+    #[doc(hidden)]
     pub fn memory_dump(buffer: &[u8]) -> String {
         if buffer.is_empty() {
             return String::new();
@@ -427,6 +526,13 @@ impl Xlog {
     }
 }
 
+#[cfg(any(
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "watchos"
+))]
+#[doc(hidden)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ConsoleFun {
     Printf = 0,
@@ -508,6 +614,7 @@ impl CStringHolder {
     }
 }
 
+/// Log with explicit metadata captured by the macro call site.
 #[cfg(feature = "macros")]
 #[macro_export]
 macro_rules! xlog {
@@ -521,6 +628,7 @@ macro_rules! xlog {
     }};
 }
 
+/// Convenience macro for `LogLevel::Debug`.
 #[cfg(feature = "macros")]
 #[macro_export]
 macro_rules! xlog_debug {
@@ -529,6 +637,7 @@ macro_rules! xlog_debug {
     }};
 }
 
+/// Convenience macro for `LogLevel::Info`.
 #[cfg(feature = "macros")]
 #[macro_export]
 macro_rules! xlog_info {
@@ -537,6 +646,7 @@ macro_rules! xlog_info {
     }};
 }
 
+/// Convenience macro for `LogLevel::Warn`.
 #[cfg(feature = "macros")]
 #[macro_export]
 macro_rules! xlog_warn {
@@ -545,6 +655,7 @@ macro_rules! xlog_warn {
     }};
 }
 
+/// Convenience macro for `LogLevel::Error`.
 #[cfg(feature = "macros")]
 #[macro_export]
 macro_rules! xlog_error {

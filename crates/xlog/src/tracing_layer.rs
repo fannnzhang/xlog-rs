@@ -1,3 +1,6 @@
+//! `tracing` layer that forwards events into Mars Xlog.
+//!
+//! This module is gated behind the `tracing` feature.
 use crate::{LogLevel, Xlog};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -7,11 +10,16 @@ use tracing::{Event, Level, Metadata, Subscriber};
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::registry::LookupSpan;
 
+/// Configuration for `XlogLayer`.
 #[derive(Debug, Clone)]
 pub struct XlogLayerConfig {
+    /// Whether the layer should emit logs.
     pub enabled: bool,
+    /// Minimum log level to forward.
     pub level: LogLevel,
+    /// Optional tag override (defaults to `Metadata::target()`).
     pub tag: Option<String>,
+    /// Include span names in the formatted message.
     pub include_spans: bool,
 }
 
@@ -46,30 +54,38 @@ impl XlogLayerConfig {
     }
 }
 
+/// Handle used to toggle a running `XlogLayer`.
 #[derive(Clone)]
 pub struct XlogLayerHandle {
     state: Arc<LayerState>,
 }
 
 impl XlogLayerHandle {
+    /// Enable or disable forwarding.
     pub fn set_enabled(&self, enabled: bool) {
         self.state.enabled.store(enabled, Ordering::Release);
     }
 
+    /// Check whether forwarding is enabled.
     pub fn enabled(&self) -> bool {
         self.state.enabled.load(Ordering::Acquire)
     }
 
+    /// Update the minimum log level.
     pub fn set_level(&self, level: LogLevel) {
         self.state.logger.set_level(level);
-        self.state.level.store(level_to_u8(level), Ordering::Release);
+        self.state
+            .level
+            .store(level_to_u8(level), Ordering::Release);
     }
 
+    /// Read the current minimum log level.
     pub fn level(&self) -> LogLevel {
         level_from_u8(self.state.level.load(Ordering::Acquire))
     }
 }
 
+/// `tracing-subscriber` layer that forwards events to a `Xlog` instance.
 pub struct XlogLayer {
     state: Arc<LayerState>,
     tag: Option<String>,
@@ -77,11 +93,13 @@ pub struct XlogLayer {
 }
 
 impl XlogLayer {
+    /// Build a layer using the logger's current level and defaults.
     pub fn new(logger: Xlog) -> (Self, XlogLayerHandle) {
         let config = XlogLayerConfig::new(logger.level());
         Self::with_config(logger, config)
     }
 
+    /// Build a layer from explicit configuration.
     pub fn with_config(logger: Xlog, config: XlogLayerConfig) -> (Self, XlogLayerHandle) {
         logger.set_level(config.level);
         let state = Arc::new(LayerState::new(logger, config.enabled, config.level));
@@ -94,6 +112,7 @@ impl XlogLayer {
         (layer, handle)
     }
 
+    /// Create a new handle that can be used to reconfigure the layer.
     pub fn handle(&self) -> XlogLayerHandle {
         XlogLayerHandle {
             state: Arc::clone(&self.state),
@@ -161,10 +180,7 @@ where
             message = metadata.name().to_string();
         }
 
-        let tag = self
-            .tag
-            .as_deref()
-            .unwrap_or_else(|| metadata.target());
+        let tag = self.tag.as_deref().unwrap_or_else(|| metadata.target());
         let file = metadata.file().unwrap_or("<unknown>");
         let module = metadata.module_path().unwrap_or("<unknown>");
         let line = metadata.line().unwrap_or(0);
@@ -231,7 +247,7 @@ impl EventVisitor {
 }
 
 impl Visit for EventVisitor {
-    fn record_bool(&mut self, field: &Field, value: bool) {
+    fn record_f64(&mut self, field: &Field, value: f64) {
         self.record_field(field, value.to_string());
     }
 
@@ -243,7 +259,7 @@ impl Visit for EventVisitor {
         self.record_field(field, value.to_string());
     }
 
-    fn record_f64(&mut self, field: &Field, value: f64) {
+    fn record_bool(&mut self, field: &Field, value: bool) {
         self.record_field(field, value.to_string());
     }
 

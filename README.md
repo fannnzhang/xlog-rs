@@ -6,6 +6,8 @@ This workspace provides Rust bindings for Tencent Mars `xlog` using a C ABI wrap
 - `mars-xlog-sys`: raw FFI + native build (C/C++/ObjC++).
 - `mars-xlog`: safe Rust wrapper API.
 - `mars-xlog-uniffi`: minimal UniFFI surface (Kotlin/Swift friendly).
+- `mars-xlog-android-jni`: JNI bridge used by the Android example app.
+- `oh-xlog`: Harmony/ohos N-API bindings.
 
 ## Build notes
 - Default source path: `./third_party/mars/mars` relative to this workspace.
@@ -41,8 +43,8 @@ fn main() -> anyhow::Result<()> {
         .compress_mode(CompressMode::Zlib)
         .compress_level(6);
 
-    let logger = Xlog::new(cfg, LogLevel::Debug)?;
-    logger.write(LogLevel::Info, Some("demo"), "hello from rust");
+    let logger = Xlog::init(cfg, LogLevel::Debug)?;
+    logger.log(LogLevel::Info, None, "hello from rust");
     logger.flush(true);
     Ok(())
 }
@@ -56,7 +58,7 @@ use tracing_subscriber::prelude::*;
 
 fn init_tracing() -> anyhow::Result<mars_xlog::XlogLayerHandle> {
     let cfg = XlogConfig::new("/tmp/xlog", "demo");
-    let logger = Xlog::new(cfg, LogLevel::Info)?;
+    let logger = Xlog::init(cfg, LogLevel::Info)?;
 
     let (layer, handle) = XlogLayer::with_config(
         logger,
@@ -75,9 +77,14 @@ handle.set_enabled(false);
 handle.set_level(LogLevel::Warn);
 ```
 
+## Example (Android JNI)
+An Android app example that calls the `mars-xlog` crate via JNI lives at:
+`examples/android-jni`. See its README for build steps.
+
 ## Notes
-- `Xlog::write` does not capture caller file/line. Use the `xlog!` macros (feature `macros`) or `write_with_meta` for accurate metadata.
+ - `Xlog::log`/`Xlog::write` capture caller file/line but not function name. Use the `xlog!` macros (feature `macros`) or `write_with_meta` for full metadata.
 - iOS ObjC++ sources are included to preserve original behavior.
+ - For low-level/global appender APIs, use `mars-xlog-sys`.
 
 ## License
 MIT. See `LICENSE` and `NOTICE`.
