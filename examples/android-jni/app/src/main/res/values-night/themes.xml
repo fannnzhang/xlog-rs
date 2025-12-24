@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.XlogExample" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="colorPrimary">#111111</item>
+        <item name="colorPrimaryDark">#000000</item>
+        <item name="colorAccent">#00ff99</item>
+    </style>
+</resources>

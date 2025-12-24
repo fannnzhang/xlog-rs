@@ -9,7 +9,7 @@ plugins {
 android {
     namespace = "com.tencent.mars.xlog"
     compileSdk = 35
-
+    ndkVersion = "23.1.7779620"
     defaultConfig {
         minSdk = 24
         ndk {
@@ -21,6 +21,10 @@ android {
         sourceCompatibility = JavaVersion.VERSION_21
         targetCompatibility = JavaVersion.VERSION_21
     }
+
+    packaging {
+            jniLibs.keepDebugSymbols += "**/*.so"
+        }
 
     kotlinOptions {
         jvmTarget = "21"

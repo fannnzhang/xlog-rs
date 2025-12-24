@@ -4,6 +4,8 @@ members = [
     "crates/xlog-sys",
     "crates/xlog",
     "crates/xlog-uniffi",
+    "crates/xlog-android-jni",
+    "crates/mars-xlog-harmony-napi"
 ]
 
 [workspace.package]

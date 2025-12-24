@@ -6,8 +6,15 @@ license = "MIT"
 links = "mars_xlog"
 build = "build.rs"
 
+[lib]
+crate-type = ["rlib"]
+
 [dependencies]
 libc = { workspace = true }
 
 [build-dependencies]
 cc = "1"
+
+[profile.release]
+lto = true
+strip = true

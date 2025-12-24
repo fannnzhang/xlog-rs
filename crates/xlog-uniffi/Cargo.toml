@@ -5,9 +5,15 @@ edition = "2021"
 license = "MIT"
 
 [lib]
-crate-type = ["cdylib", "staticlib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-mars-xlog = { path = "../xlog" }
+mars-xlog = { path = "../xlog", features = ["tracing"] }
 thiserror = { workspace = true }
-uniffi = "0.29.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+uniffi = { version = "0.30.0"}
+
+[profile.release]
+lto = true
+strip = true

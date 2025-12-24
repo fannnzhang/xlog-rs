@@ -33,7 +33,10 @@ fn main() {
         .unwrap_or_else(|_| manifest_dir.join("../../third_party/mars/mars"));
 
     if !mars_dir.exists() {
-        panic!("mars source dir not found: {} (set MARS_SRC_DIR to override)", mars_dir.display());
+        panic!(
+            "mars source dir not found: {} (set MARS_SRC_DIR to override)",
+            mars_dir.display()
+        );
     }
 
     let mars_parent = mars_dir
@@ -44,6 +47,10 @@ fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target = env::var("TARGET").unwrap_or_default();
     let is_android_armv7 = target_os == "android" && target.contains("armv7");
+    let is_ohos = target_os == "ohos"
+        || target_os == "harmony"
+        || target_os == "harmonyos"
+        || target.contains("ohos");
 
     let native_dir = manifest_dir.join("native");
     let mut cpp_files: Vec<PathBuf> = Vec::new();
@@ -52,7 +59,10 @@ fn main() {
     // wrapper + stubs
     push_file(&mut cpp_files, native_dir.join("mars_xlog_wrapper.cc"));
     push_file(&mut cpp_files, native_dir.join("strutil_stub.cc"));
-    println!("cargo:rerun-if-changed={}", native_dir.join("mars_xlog_wrapper.h").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        native_dir.join("mars_xlog_wrapper.h").display()
+    );
 
     // xlog core
     push_file(&mut cpp_files, mars_dir.join("xlog/src/appender.cc"));
@@ -60,12 +70,18 @@ fn main() {
     push_file(&mut cpp_files, mars_dir.join("xlog/src/log_base_buffer.cc"));
     push_file(&mut cpp_files, mars_dir.join("xlog/src/log_zlib_buffer.cc"));
     push_file(&mut cpp_files, mars_dir.join("xlog/src/log_zstd_buffer.cc"));
-    push_file(&mut cpp_files, mars_dir.join("xlog/src/xlogger_interface.cc"));
+    push_file(
+        &mut cpp_files,
+        mars_dir.join("xlog/src/xlogger_interface.cc"),
+    );
     push_file(&mut cpp_files, mars_dir.join("xlog/crypt/log_crypt.cc"));
 
     // xlogger
     push_file(&mut cpp_files, mars_dir.join("comm/xlogger/xlogger.cc"));
-    push_file(&mut cpp_files, mars_dir.join("comm/xlogger/xlogger_category.cc"));
+    push_file(
+        &mut cpp_files,
+        mars_dir.join("comm/xlogger/xlogger_category.cc"),
+    );
 
     // comm basics
     push_file(&mut cpp_files, mars_dir.join("comm/autobuffer.cc"));
@@ -100,23 +116,48 @@ fn main() {
     // platform-specific console + threadinfo
     if target_os == "android" {
         push_file(&mut cpp_files, mars_dir.join("xlog/jni/ConsoleLog.cc"));
-        push_file(&mut cpp_files, mars_dir.join("comm/unix/xlogger_threadinfo.cc"));
-    } else if target_os == "ios" || target_os == "macos" || target_os == "tvos" || target_os == "watchos" {
+        push_file(
+            &mut cpp_files,
+            mars_dir.join("comm/unix/xlogger_threadinfo.cc"),
+        );
+    } else if target_os == "ios"
+        || target_os == "macos"
+        || target_os == "tvos"
+        || target_os == "watchos"
+    {
         push_file(&mut cpp_files, mars_dir.join("xlog/objc/objc_console.mm"));
-        push_file(&mut cpp_files, mars_dir.join("comm/objc/data_protect_attr.mm"));
-        push_file(&mut cpp_files, mars_dir.join("comm/objc/scope_autoreleasepool.mm"));
-        push_file(&mut cpp_files, mars_dir.join("comm/objc/xlogger_threadinfo.mm"));
-    } else if target_os == "ohos" || target_os == "harmony" || target_os == "harmonyos" || target.contains("ohos") {
+        push_file(
+            &mut cpp_files,
+            mars_dir.join("comm/objc/data_protect_attr.mm"),
+        );
+        push_file(
+            &mut cpp_files,
+            mars_dir.join("comm/objc/scope_autoreleasepool.mm"),
+        );
+        push_file(
+            &mut cpp_files,
+            mars_dir.join("comm/objc/xlogger_threadinfo.mm"),
+        );
+    } else if is_ohos {
         push_file(&mut cpp_files, mars_dir.join("xlog/ohos/ConsoleLog.cc"));
-        push_file(&mut cpp_files, mars_dir.join("comm/unix/xlogger_threadinfo.cc"));
+        push_file(
+            &mut cpp_files,
+            mars_dir.join("comm/unix/xlogger_threadinfo.cc"),
+        );
     } else {
         push_file(&mut cpp_files, mars_dir.join("xlog/unix/ConsoleLog.cc"));
-        push_file(&mut cpp_files, mars_dir.join("comm/unix/xlogger_threadinfo.cc"));
+        push_file(
+            &mut cpp_files,
+            mars_dir.join("comm/unix/xlogger_threadinfo.cc"),
+        );
     }
 
     // C sources
     push_file(&mut c_files, mars_dir.join("comm/xlogger/xloggerbase.c"));
-    push_file(&mut c_files, mars_dir.join("comm/xlogger/loginfo_extract.c"));
+    push_file(
+        &mut c_files,
+        mars_dir.join("comm/xlogger/loginfo_extract.c"),
+    );
     push_file(&mut c_files, mars_dir.join("comm/assert/__assert.c"));
     push_file(&mut c_files, mars_dir.join("comm/time_utils.c"));
 
@@ -144,6 +185,9 @@ fn main() {
 
     if target_os == "android" {
         cpp_build.define("ANDROID", None);
+    }
+    if is_ohos {
+        cpp_build.define("OHOS", None);
     }
 
     // include paths
@@ -176,6 +220,9 @@ fn main() {
     if target_os == "android" {
         c_build.define("ANDROID", None);
     }
+    if is_ohos {
+        c_build.define("OHOS", None);
+    }
     // clang's integrated assembler doesn't support .syntax divided in micro-ecc ARM asm.
     // Disable ARM asm on armv7 Android by forcing the generic C implementation.
     if is_android_armv7 {
@@ -207,6 +254,28 @@ fn main() {
         println!("cargo:rustc-link-lib=c++");
         println!("cargo:rustc-link-lib=objc");
         println!("cargo:rustc-link-lib=framework=Foundation");
+    } else if is_ohos {
+        let ndk = env::var("OHOS_NDK_HOME").expect("OHOS_NDK_HOME not set.");
+        let target = env::var("TARGET").expect("Try to get build target failed.");
+
+        let lib_dir = match target.as_ref() {
+            "aarch64-unknown-linux-ohos" => "aarch64-linux-ohos",
+            "armv7-unknown-linux-ohos" => "arm-linux-ohos",
+            "x86_64-unknown-linux-ohos" => "x86_64-linux-ohos",
+            _ => "",
+        };
+
+        // for libc++_shared.so etc.
+        println!(
+            "cargo:rustc-link-search={}/native/llvm/lib/{}",
+            &ndk, &lib_dir
+        );
+
+        // link libace_napi.z.so
+        println!("cargo:rustc-link-lib=dylib=ace_napi.z");
+
+        println!("cargo:rustc-link-lib=hilog_ndk.z");
+        println!("cargo:rustc-link-lib=c++_shared");
     } else {
         println!("cargo:rustc-link-lib=stdc++");
     }
@@ -216,12 +285,5 @@ fn main() {
     if target_os == "android" {
         println!("cargo:rustc-link-lib=log");
         println!("cargo:rustc-link-lib=android");
-    }
-    if target_os == "ohos" || target_os == "harmony" || target_os == "harmonyos" || target.contains("ohos") {
-        println!("cargo:rustc-link-lib=hilog");
-    }
-
-    if target_os == "linux" || target_os == "ohos" || target_os == "harmony" || target_os == "harmonyos" {
-        println!("cargo:rustc-link-lib=pthread");
     }
 }

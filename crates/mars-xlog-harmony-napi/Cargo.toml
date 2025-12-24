@@ -1,0 +1,27 @@
+[package]
+name    = "oh-xlog"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mars-xlog = { path = "../xlog", features = ["tracing"] }
+napi-ohos = { version = "1.0", default-features = false, features = [
+    "napi8",
+    "async",
+] }
+napi-derive-ohos = { version = "1.0" }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.22"
+thiserror = "1.0.69"
+
+[build-dependencies]
+napi-build-ohos = { version = "1.0" }
+
+[profile.release]
+lto = true
+strip = true
