@@ -47,6 +47,8 @@ fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target = env::var("TARGET").unwrap_or_default();
     let is_android_armv7 = target_os == "android" && target.contains("armv7");
+    let is_android_arm64 =
+        target_os == "android" && (target.contains("aarch64") || target.contains("arm64"));
     let is_ohos = target_os == "ohos"
         || target_os == "harmony"
         || target_os == "harmonyos"
@@ -278,6 +280,11 @@ fn main() {
         println!("cargo:rustc-link-lib=c++_shared");
     } else {
         println!("cargo:rustc-link-lib=stdc++");
+    }
+
+    if is_android_arm64 {
+        println!("cargo:rustc-link-arg=-Wl,-z,max-page-size=16384");
+        println!("cargo:rustc-link-arg=-Wl,-z,common-page-size=4096");
     }
 
     // system libs
