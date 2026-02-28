@@ -20,7 +20,7 @@
   - 已完成 2A：`xlog-core` 协议/压缩/加密基础模块。
   - 已完成 2B：`xlog` Rust backend 最小写入链路接入（可生成 `.xlog` block）。
   - 已完成 2C-1：fixture 生成与 no-crypt 解码对比脚本。
-  - 未完成 2C-2：crypt 用例在 Python2 官方解码环境下的回归固化。
+  - 已完成 2C-2：crypt 用例在 Python2 官方解码环境下的回归固化（`scripts/xlog/setup_py2_decoder_env.sh` + `scripts/xlog/run_phase2c2_official.sh`）。
 - Phase 3~6：未开始。
 
 ---
@@ -262,7 +262,7 @@ seq 规则：
 - 解码脚本路径改为：
   - `third_party/mars/mars/xlog/crypt/decode_mars_nocrypt_log_file.py`
   - `third_party/mars/mars/xlog/crypt/decode_mars_crypt_log_file.py`
-- 记录脚本依赖（Python2 + `zstandard` + `pyelliptic`）并提供容器脚本。
+- 记录脚本依赖（Python2 + `zstandard` + `pyelliptic`）并提供一键环境脚本：`scripts/xlog/setup_py2_decoder_env.sh`。
 
 DoD：
 
@@ -315,7 +315,9 @@ DoD：
 
 1. **Phase 2A（已完成）**：核心原语实现。
 2. **Phase 2B（已完成）**：`xlog` Rust backend 最小集成。
-3. **Phase 2C（进行中）**：官方解码兼容夹具与回归脚本。
+3. **Phase 2C（已完成）**：官方解码兼容夹具与回归脚本。
+   - 2C-1（已完成）：`gen_fixtures.sh + decode_compare.sh` no-crypt 回归。
+   - 2C-2（已完成）：Python2 官方 crypt 解码环境固化与回归脚本接入。
 
 涉及文件：
 
@@ -333,6 +335,8 @@ DoD：
 - 新增 `scripts/xlog/gen_fixtures.sh`
 - 新增 `scripts/xlog/decode_compare.sh`
 - 新增 `scripts/xlog/decode_mars_nocrypt_py3.py`
+- 新增 `scripts/xlog/setup_py2_decoder_env.sh`
+- 新增 `scripts/xlog/run_phase2c2_official.sh`
 
 实现要点：
 
@@ -354,6 +358,8 @@ DoD：
   - `gen_fixture.rs` 生成带固定消息载荷的 `.xlog` 样本（`FIXTURE|<prefix>|<seq>`）。
   - `gen_fixtures.sh` 批量生成 Rust/FFI 的 zlib/zstd + sync/async 样本与 `manifest.tsv`。
   - `decode_compare.sh` 调用官方 Python2 解码脚本（可用时）或 Python3 no-crypt 兼容解码器进行结果对比，并校验 Rust/FFI 载荷一致性。
+  - `setup_py2_decoder_env.sh` 负责 Python2 + `pyelliptic` + `zstandard` 一键安装与兼容补丁。
+  - `run_phase2c2_official.sh` 固化“生成 crypt fixtures + official decoder 对比”的收口入口。
 
 DoD：
 
