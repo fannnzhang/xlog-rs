@@ -19,7 +19,8 @@
 - Phase 2：进行中（commit: `c1b6e10` + 当前增量）。
   - 已完成 2A：`xlog-core` 协议/压缩/加密基础模块。
   - 已完成 2B：`xlog` Rust backend 最小写入链路接入（可生成 `.xlog` block）。
-  - 未完成 2C：与官方解码脚本的系统化 fixture 对比。
+  - 已完成 2C-1：fixture 生成与 no-crypt 解码对比脚本。
+  - 未完成 2C-2：crypt 用例在 Python2 官方解码环境下的回归固化。
 - Phase 3~6：未开始。
 
 ---
@@ -314,7 +315,7 @@ DoD：
 
 1. **Phase 2A（已完成）**：核心原语实现。
 2. **Phase 2B（已完成）**：`xlog` Rust backend 最小集成。
-3. **Phase 2C（待完成）**：官方解码兼容夹具与回归脚本。
+3. **Phase 2C（进行中）**：官方解码兼容夹具与回归脚本。
 
 涉及文件：
 
@@ -328,6 +329,10 @@ DoD：
 - 修改 `crates/xlog/src/backend/rust.rs`
 - 修改 `crates/xlog/src/backend/mod.rs`
 - 修改 `crates/xlog/Cargo.toml`
+- 新增 `crates/xlog/examples/gen_fixture.rs`
+- 新增 `scripts/xlog/gen_fixtures.sh`
+- 新增 `scripts/xlog/decode_compare.sh`
+- 新增 `scripts/xlog/decode_mars_nocrypt_py3.py`
 
 实现要点：
 
@@ -345,13 +350,18 @@ DoD：
   - 复用 `xlog-core` 的 formatter/protocol/compress/crypto 组件拼装完整 block。
   - 先实现直接文件 append 路径，`oneshot_flush` 暂返回 `Unnecessary`。
   - 默认 appender 与 named instance 注册先在 `xlog` 层用 `OnceLock + Mutex<HashMap<...>>` 落地，为 Phase 4 的引擎替换预留接口形态。
+- Phase 2C 脚本化回归：
+  - `gen_fixture.rs` 生成带固定消息载荷的 `.xlog` 样本（`FIXTURE|<prefix>|<seq>`）。
+  - `gen_fixtures.sh` 批量生成 Rust/FFI 的 zlib/zstd + sync/async 样本与 `manifest.tsv`。
+  - `decode_compare.sh` 调用官方 Python2 解码脚本（可用时）或 Python3 no-crypt 兼容解码器进行结果对比，并校验 Rust/FFI 载荷一致性。
 
 DoD：
 
 - `protocol_compat` 覆盖 magic/seq/len/hour。
 - `compress_roundtrip` 覆盖 zlib/zstd 压缩回环。
 - `xlog` 在 `--features rust-backend` 下可完成写文件的单元测试。
-- 生成文件可被官方脚本解码（该项在 Phase 2C 收口）。
+- no-crypt 样本可完成脚本化解码对比。
+- crypt 样本可在 Python2 官方解码环境下回归（Phase 2C-2 收口）。
 
 ---
 
