@@ -1,0 +1,303 @@
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
+use thiserror::Error;
+
+use crate::buffer::{validate_block, BufferError, PersistentBuffer};
+use crate::file_manager::{FileManager, FileManagerError};
+
+const ASYNC_FLUSH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const MIN_LOG_ALIVE_SECONDS: i64 = 24 * 60 * 60;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum EngineMode {
+    Async,
+    Sync,
+}
+
+#[derive(Debug, Error)]
+pub enum AppenderEngineError {
+    #[error("buffer error: {0}")]
+    Buffer(#[from] BufferError),
+    #[error("file manager error: {0}")]
+    FileManager(#[from] FileManagerError),
+    #[error("engine worker channel closed")]
+    ChannelClosed,
+}
+
+struct EngineState {
+    file_manager: FileManager,
+    buffer: PersistentBuffer,
+    max_file_size: u64,
+    max_alive_time: i64,
+}
+
+enum EngineCommand {
+    Flush {
+        move_file: bool,
+        ack: Option<Sender<()>>,
+    },
+    Stop {
+        ack: Sender<()>,
+    },
+}
+
+pub struct AppenderEngine {
+    mode: AtomicI32,
+    state: Arc<Mutex<EngineState>>,
+    tx: Sender<EngineCommand>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl AppenderEngine {
+    pub fn new(
+        file_manager: FileManager,
+        buffer: PersistentBuffer,
+        mode: EngineMode,
+        max_file_size: u64,
+        max_alive_time: i64,
+    ) -> Self {
+        let state = Arc::new(Mutex::new(EngineState {
+            file_manager,
+            buffer,
+            max_file_size,
+            max_alive_time: max_alive_time.max(MIN_LOG_ALIVE_SECONDS),
+        }));
+        let (tx, rx) = unbounded();
+        let worker_state = Arc::clone(&state);
+        let worker = thread::Builder::new()
+            .name("xlog-appender-engine".to_string())
+            .spawn(move || run_worker_loop(worker_state, rx))
+            .expect("spawn appender engine thread");
+
+        Self {
+            mode: AtomicI32::new(mode_to_i32(mode)),
+            state,
+            tx,
+            worker: Mutex::new(Some(worker)),
+        }
+    }
+
+    pub fn mode(&self) -> EngineMode {
+        i32_to_mode(self.mode.load(Ordering::Relaxed))
+    }
+
+    pub fn set_mode(&self, mode: EngineMode) -> Result<(), AppenderEngineError> {
+        let old = i32_to_mode(self.mode.swap(mode_to_i32(mode), Ordering::Relaxed));
+        if old == EngineMode::Async && mode == EngineMode::Sync {
+            self.flush(true)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_max_file_size(&self, max_file_size: u64) {
+        if let Ok(mut state) = self.state.lock() {
+            state.max_file_size = max_file_size;
+        }
+    }
+
+    pub fn set_max_alive_time(&self, alive_seconds: i64) {
+        if alive_seconds < MIN_LOG_ALIVE_SECONDS {
+            return;
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.max_alive_time = alive_seconds;
+        }
+    }
+
+    pub fn max_file_size(&self) -> u64 {
+        self.state
+            .lock()
+            .map(|s| s.max_file_size)
+            .unwrap_or_default()
+    }
+
+    pub fn log_dir(&self) -> Option<String> {
+        self.state
+            .lock()
+            .ok()
+            .map(|s| s.file_manager.log_dir().to_string_lossy().to_string())
+    }
+
+    pub fn cache_dir(&self) -> Option<String> {
+        self.state.lock().ok().and_then(|s| {
+            s.file_manager
+                .cache_dir()
+                .map(|p| p.to_string_lossy().to_string())
+        })
+    }
+
+    pub fn filepaths_from_timespan(&self, timespan: i32, prefix: &str) -> Vec<String> {
+        self.state
+            .lock()
+            .map(|s| s.file_manager.filepaths_from_timespan(timespan, prefix))
+            .unwrap_or_default()
+    }
+
+    pub fn make_logfile_name(&self, timespan: i32, prefix: &str) -> Vec<String> {
+        self.state
+            .lock()
+            .map(|s| {
+                s.file_manager
+                    .make_logfile_name(timespan, prefix, s.max_file_size)
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn write_block(&self, block: &[u8], force_flush: bool) -> Result<(), AppenderEngineError> {
+        validate_block(block)?;
+
+        match self.mode() {
+            EngineMode::Sync => {
+                let mut state = self.state.lock().expect("state lock poisoned");
+                state
+                    .file_manager
+                    .append_log_bytes(block, state.max_file_size, false)?;
+                housekeep_locked(&mut state)?;
+            }
+            EngineMode::Async => {
+                let should_flush = {
+                    let mut state = self.state.lock().expect("state lock poisoned");
+                    let appended = state.buffer.append_block(block)?;
+
+                    if !appended {
+                        flush_pending_locked(&mut state, true)?;
+                        let appended_after_flush = state.buffer.append_block(block)?;
+                        if !appended_after_flush {
+                            state.file_manager.append_log_bytes(
+                                block,
+                                state.max_file_size,
+                                true,
+                            )?;
+                        }
+                    }
+
+                    let threshold = state.buffer.capacity() / 3;
+                    force_flush || state.buffer.len() >= threshold
+                };
+
+                if should_flush {
+                    self.request_flush(false, true)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn flush(&self, sync: bool) -> Result<(), AppenderEngineError> {
+        if self.mode() == EngineMode::Sync {
+            let mut state = self.state.lock().expect("state lock poisoned");
+            housekeep_locked(&mut state)?;
+            return Ok(());
+        }
+        self.request_flush(sync, true)
+    }
+
+    fn request_flush(&self, sync: bool, move_file: bool) -> Result<(), AppenderEngineError> {
+        if sync {
+            let (ack_tx, ack_rx) = bounded(1);
+            self.tx
+                .send(EngineCommand::Flush {
+                    move_file,
+                    ack: Some(ack_tx),
+                })
+                .map_err(|_| AppenderEngineError::ChannelClosed)?;
+            ack_rx
+                .recv()
+                .map_err(|_| AppenderEngineError::ChannelClosed)?;
+            return Ok(());
+        }
+
+        self.tx
+            .send(EngineCommand::Flush {
+                move_file,
+                ack: None,
+            })
+            .map_err(|_| AppenderEngineError::ChannelClosed)
+    }
+}
+
+impl Drop for AppenderEngine {
+    fn drop(&mut self) {
+        let Some(worker) = self.worker.lock().ok().and_then(|mut w| w.take()) else {
+            return;
+        };
+
+        let (ack_tx, ack_rx) = bounded(1);
+        let _ = self.tx.send(EngineCommand::Stop { ack: ack_tx });
+        let _ = ack_rx.recv_timeout(Duration::from_secs(2));
+        let _ = worker.join();
+    }
+}
+
+fn run_worker_loop(state: Arc<Mutex<EngineState>>, rx: Receiver<EngineCommand>) {
+    loop {
+        match rx.recv_timeout(ASYNC_FLUSH_TIMEOUT) {
+            Ok(EngineCommand::Flush { move_file, ack }) => {
+                let _ = state
+                    .lock()
+                    .map_err(|_| ())
+                    .and_then(|mut s| flush_pending_locked(&mut s, move_file).map_err(|_| ()));
+                if let Some(ack) = ack {
+                    let _ = ack.send(());
+                }
+            }
+            Ok(EngineCommand::Stop { ack }) => {
+                let _ = state
+                    .lock()
+                    .map_err(|_| ())
+                    .and_then(|mut s| flush_pending_locked(&mut s, true).map_err(|_| ()));
+                let _ = ack.send(());
+                break;
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let _ = state
+                    .lock()
+                    .map_err(|_| ())
+                    .and_then(|mut s| flush_pending_locked(&mut s, true).map_err(|_| ()));
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+fn flush_pending_locked(
+    state: &mut EngineState,
+    move_file: bool,
+) -> Result<(), AppenderEngineError> {
+    let pending = state.buffer.take_all()?;
+    if !pending.is_empty() {
+        state
+            .file_manager
+            .append_log_bytes(&pending, state.max_file_size, move_file)?;
+    }
+    housekeep_locked(state)
+}
+
+fn housekeep_locked(state: &mut EngineState) -> Result<(), AppenderEngineError> {
+    state
+        .file_manager
+        .move_old_cache_files(state.max_file_size)?;
+    state
+        .file_manager
+        .delete_expired_files(state.max_alive_time)?;
+    Ok(())
+}
+
+fn mode_to_i32(mode: EngineMode) -> i32 {
+    match mode {
+        EngineMode::Async => 0,
+        EngineMode::Sync => 1,
+    }
+}
+
+fn i32_to_mode(v: i32) -> EngineMode {
+    if v == 1 {
+        EngineMode::Sync
+    } else {
+        EngineMode::Async
+    }
+}

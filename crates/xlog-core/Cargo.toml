@@ -8,6 +8,7 @@ license = "MIT"
 crate-type = ["rlib"]
 
 [dependencies]
+libc = { workspace = true }
 thiserror = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 flate2 = "1"
@@ -17,6 +18,7 @@ rand_core = "0.6"
 hex = "0.4"
 memmap2 = "0.9"
 fs2 = "0.4"
+crossbeam-channel = "0.5"
 
 [dev-dependencies]
 hex = "0.4"

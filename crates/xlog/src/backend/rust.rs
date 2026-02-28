@@ -1,22 +1,23 @@
-use std::collections::HashMap;
-use std::io;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use chrono::Local;
+use mars_xlog_core::appender_engine::{AppenderEngine, EngineMode};
 use mars_xlog_core::buffer::{PersistentBuffer, DEFAULT_BUFFER_BLOCK_LEN};
 use mars_xlog_core::compress::{StreamCompressor, ZlibStreamCompressor, ZstdChunkCompressor};
 use mars_xlog_core::crypto::EcdhTeaCipher;
+use mars_xlog_core::dump::{dump_to_file, memory_dump};
 use mars_xlog_core::file_manager::FileManager;
-use mars_xlog_core::formatter::format_record;
 use mars_xlog_core::oneshot::{
     oneshot_flush as core_oneshot_flush, FileIoAction as CoreFileIoAction,
 };
+use mars_xlog_core::platform_console::{write_console_line, ConsoleLevel};
+use mars_xlog_core::platform_tid::current_tid;
 use mars_xlog_core::protocol::{
     select_magic, AppendMode, CompressionKind, LogHeader, SeqGenerator, MAGIC_END,
 };
 use mars_xlog_core::record::{LogLevel as CoreLogLevel, LogRecord};
+use mars_xlog_core::registry::InstanceRegistry;
 
 use super::{XlogBackend, XlogBackendProvider};
 use crate::{AppenderMode, CompressMode, FileIoAction, LogLevel, XlogConfig, XlogError};
@@ -36,34 +37,21 @@ pub(super) fn provider() -> &'static dyn XlogBackendProvider {
 
 struct RustBackendProvider;
 
-struct BackendRuntime {
-    file_manager: FileManager,
-    buffer: PersistentBuffer,
-}
-
 struct RustBackend {
     id: usize,
     config: XlogConfig,
     level: AtomicI32,
-    appender_mode: AtomicI32,
     console_open: AtomicBool,
-    max_file_size: AtomicI64,
-    max_alive_time: AtomicI64,
     seq: SeqGenerator,
     cipher: EcdhTeaCipher,
-    runtime: Mutex<BackendRuntime>,
+    engine: AppenderEngine,
 }
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
-fn instances() -> &'static Mutex<HashMap<String, Weak<RustBackend>>> {
-    static INSTANCES: OnceLock<Mutex<HashMap<String, Weak<RustBackend>>>> = OnceLock::new();
-    INSTANCES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn default_backend() -> &'static Mutex<Option<Arc<RustBackend>>> {
-    static DEFAULT: OnceLock<Mutex<Option<Arc<RustBackend>>>> = OnceLock::new();
-    DEFAULT.get_or_init(|| Mutex::new(None))
+fn registry() -> &'static InstanceRegistry<RustBackend> {
+    static REGISTRY: OnceLock<InstanceRegistry<RustBackend>> = OnceLock::new();
+    REGISTRY.get_or_init(InstanceRegistry::new)
 }
 
 impl RustBackend {
@@ -80,39 +68,35 @@ impl RustBackend {
         };
 
         let file_manager = FileManager::new(
-            PathBuf::from(&config.log_dir),
-            config.cache_dir.as_ref().map(PathBuf::from),
+            config.log_dir.clone().into(),
+            config.cache_dir.clone().map(Into::into),
             config.name_prefix.clone(),
             config.cache_days,
         )
         .map_err(|_| XlogError::InitFailed)?;
-        let mmap_path = file_manager.mmap_path();
-        let buffer = PersistentBuffer::open_with_capacity(mmap_path, DEFAULT_BUFFER_BLOCK_LEN)
-            .map_err(|_| XlogError::InitFailed)?;
+        let buffer = PersistentBuffer::open_with_capacity(
+            file_manager.mmap_path(),
+            DEFAULT_BUFFER_BLOCK_LEN,
+        )
+        .map_err(|_| XlogError::InitFailed)?;
+
+        let engine = AppenderEngine::new(
+            file_manager,
+            buffer,
+            appender_to_engine_mode(config.mode),
+            0,
+            10 * 24 * 60 * 60,
+        );
 
         Ok(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            max_file_size: AtomicI64::new(0),
-            max_alive_time: AtomicI64::new(10 * 24 * 60 * 60),
-            appender_mode: AtomicI32::new(mode_to_i32(config.mode)),
             console_open: AtomicBool::new(false),
             level: AtomicI32::new(level_to_i32(level)),
             config,
             seq: SeqGenerator::default(),
             cipher,
-            runtime: Mutex::new(BackendRuntime {
-                file_manager,
-                buffer,
-            }),
+            engine,
         })
-    }
-
-    fn max_file_size_u64(&self) -> u64 {
-        self.max_file_size.load(Ordering::Relaxed).max(0) as u64
-    }
-
-    fn max_alive_time_i64(&self) -> i64 {
-        self.max_alive_time.load(Ordering::Relaxed)
     }
 
     fn build_block(
@@ -124,7 +108,7 @@ impl RustBackend {
         line: u32,
         msg: &str,
     ) -> Vec<u8> {
-        let mode = i32_to_mode(self.appender_mode.load(Ordering::Relaxed));
+        let mode = engine_to_appender_mode(self.engine.mode());
         let compress = self.config.compress_mode;
 
         let now = Local::now();
@@ -142,7 +126,7 @@ impl RustBackend {
             tid,
             maintid: pid,
         };
-        let line = format_record(&record, msg);
+        let line = mars_xlog_core::formatter::format_record(&record, msg);
 
         let mut payload = match mode {
             AppenderMode::Sync => line.into_bytes(),
@@ -199,101 +183,12 @@ impl RustBackend {
         block
     }
 
-    fn flush_pending_locked(
-        &self,
-        runtime: &mut BackendRuntime,
-        move_file: bool,
-    ) -> Result<(), io::Error> {
-        let pending = runtime
-            .buffer
-            .take_all()
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        if pending.is_empty() {
-            return Ok(());
-        }
-        runtime
-            .file_manager
-            .append_log_bytes(&pending, self.max_file_size_u64(), move_file)
-            .map_err(|e| io::Error::other(e.to_string()))
-    }
-
-    fn housekeeping_locked(&self, runtime: &BackendRuntime) -> Result<(), io::Error> {
-        runtime
-            .file_manager
-            .move_old_cache_files(self.max_file_size_u64())
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        runtime
-            .file_manager
-            .delete_expired_files(self.max_alive_time_i64())
-            .map_err(|e| io::Error::other(e.to_string()))
-    }
-
     fn make_logfile_name_impl(&self, timespan: i32, prefix: &str) -> Vec<String> {
-        let Ok(runtime) = self.runtime.lock() else {
-            return Vec::new();
-        };
-        runtime
-            .file_manager
-            .make_logfile_name(timespan, prefix, self.max_file_size_u64())
+        self.engine.make_logfile_name(timespan, prefix)
     }
 
     fn filepaths_from_timespan_impl(&self, timespan: i32, prefix: &str) -> Vec<String> {
-        let Ok(runtime) = self.runtime.lock() else {
-            return Vec::new();
-        };
-        runtime
-            .file_manager
-            .filepaths_from_timespan(timespan, prefix)
-    }
-
-    fn write_impl(
-        &self,
-        level: LogLevel,
-        tag: &str,
-        file: &str,
-        func: &str,
-        line: u32,
-        msg: &str,
-    ) -> Result<(), io::Error> {
-        let block = self.build_block(level, tag, file, func, line, msg);
-        let mode = i32_to_mode(self.appender_mode.load(Ordering::Relaxed));
-
-        let mut runtime = self.runtime.lock().expect("runtime lock poisoned");
-        match mode {
-            AppenderMode::Sync => {
-                runtime
-                    .file_manager
-                    .append_log_bytes(&block, self.max_file_size_u64(), false)
-                    .map_err(|e| io::Error::other(e.to_string()))?;
-            }
-            AppenderMode::Async => {
-                let appended = runtime
-                    .buffer
-                    .append_block(&block)
-                    .map_err(|e| io::Error::other(e.to_string()))?;
-
-                if !appended {
-                    self.flush_pending_locked(&mut runtime, true)?;
-                    let appended_after_flush = runtime
-                        .buffer
-                        .append_block(&block)
-                        .map_err(|e| io::Error::other(e.to_string()))?;
-                    if !appended_after_flush {
-                        runtime
-                            .file_manager
-                            .append_log_bytes(&block, self.max_file_size_u64(), true)
-                            .map_err(|e| io::Error::other(e.to_string()))?;
-                    }
-                }
-
-                let threshold = runtime.buffer.capacity() / 3;
-                if runtime.buffer.len() >= threshold || level == LogLevel::Fatal {
-                    self.flush_pending_locked(&mut runtime, true)?;
-                }
-            }
-        }
-
-        self.housekeeping_locked(&runtime)
+        self.engine.filepaths_from_timespan(timespan, prefix)
     }
 }
 
@@ -303,51 +198,35 @@ impl XlogBackendProvider for RustBackendProvider {
         config: &XlogConfig,
         level: LogLevel,
     ) -> Result<Arc<dyn XlogBackend>, XlogError> {
-        let mut map = instances().lock().expect("instances lock poisoned");
-        if let Some(existing) = map.get(&config.name_prefix).and_then(Weak::upgrade) {
-            return Ok(existing);
-        }
-
-        let backend = Arc::new(RustBackend::new(config.clone(), level)?);
-        map.insert(config.name_prefix.clone(), Arc::downgrade(&backend));
+        let backend = registry().get_or_try_insert_with(&config.name_prefix, || {
+            Ok::<_, XlogError>(Arc::new(RustBackend::new(config.clone(), level)?))
+        })?;
         Ok(backend)
     }
 
     fn get_instance(&self, name_prefix: &str) -> Option<Arc<dyn XlogBackend>> {
-        let map = instances().lock().ok()?;
-        let backend = map.get(name_prefix)?.upgrade()?;
-        Some(backend)
+        registry()
+            .get(name_prefix)
+            .map(|v| v as Arc<dyn XlogBackend>)
     }
 
     fn appender_open(&self, config: &XlogConfig, level: LogLevel) -> Result<(), XlogError> {
         let backend = Arc::new(RustBackend::new(config.clone(), level)?);
-        let mut d = default_backend()
-            .lock()
-            .expect("default backend lock poisoned");
-        *d = Some(backend);
+        registry().set_default(backend);
         Ok(())
     }
 
     fn appender_close(&self) {
-        let mut d = default_backend()
-            .lock()
-            .expect("default backend lock poisoned");
-        *d = None;
+        registry().clear_default();
     }
 
     fn flush_all(&self, sync: bool) {
-        if let Some(d) = default_backend()
-            .lock()
-            .expect("default backend lock poisoned")
-            .clone()
-        {
-            d.flush(sync);
+        if let Some(default) = registry().default_instance() {
+            default.flush(sync);
         }
-
-        let map = instances().lock().expect("instances lock poisoned");
-        for backend in map.values().filter_map(Weak::upgrade) {
+        registry().for_each_live(|backend| {
             backend.flush(sync);
-        }
+        });
     }
 
     #[cfg(any(
@@ -361,37 +240,27 @@ impl XlogBackendProvider for RustBackendProvider {
     }
 
     fn current_log_path(&self) -> Option<String> {
-        default_backend()
-            .lock()
-            .ok()?
-            .as_ref()
-            .map(|b| b.config.log_dir.clone())
+        registry()
+            .default_instance()
+            .and_then(|b| b.engine.log_dir())
     }
 
     fn current_log_cache_path(&self) -> Option<String> {
-        default_backend()
-            .lock()
-            .ok()?
-            .as_ref()?
-            .config
-            .cache_dir
-            .clone()
+        registry()
+            .default_instance()
+            .and_then(|b| b.engine.cache_dir())
     }
 
     fn filepaths_from_timespan(&self, timespan: i32, prefix: &str) -> Vec<String> {
-        default_backend()
-            .lock()
-            .ok()
-            .and_then(|d| d.clone())
+        registry()
+            .default_instance()
             .map(|b| b.filepaths_from_timespan_impl(timespan, prefix))
             .unwrap_or_default()
     }
 
     fn make_logfile_name(&self, timespan: i32, prefix: &str) -> Vec<String> {
-        default_backend()
-            .lock()
-            .ok()
-            .and_then(|d| d.clone())
+        registry()
+            .default_instance()
             .map(|b| b.make_logfile_name_impl(timespan, prefix))
             .unwrap_or_default()
     }
@@ -402,17 +271,17 @@ impl XlogBackendProvider for RustBackendProvider {
         }
 
         let file_manager = FileManager::new(
-            PathBuf::from(&config.log_dir),
-            config.cache_dir.as_ref().map(PathBuf::from),
+            config.log_dir.clone().into(),
+            config.cache_dir.clone().map(Into::into),
             config.name_prefix.clone(),
             config.cache_days,
         )
         .map_err(|_| XlogError::InitFailed)?;
 
-        let max_file_size = default_backend()
-            .lock()
-            .ok()
-            .and_then(|d| d.as_ref().map(|b| b.max_file_size_u64()))
+        let max_file_size = registry()
+            .get(&config.name_prefix)
+            .or_else(|| registry().default_instance())
+            .map(|b| b.engine.max_file_size())
             .unwrap_or(0);
 
         let action = core_oneshot_flush(&file_manager, DEFAULT_BUFFER_BLOCK_LEN, max_file_size);
@@ -429,11 +298,19 @@ impl XlogBackendProvider for RustBackendProvider {
     }
 
     fn dump(&self, buffer: &[u8]) -> String {
-        memory_dump_impl(buffer)
+        if let Some(default) = registry().default_instance() {
+            if let Some(log_dir) = default.engine.log_dir() {
+                let dumped = dump_to_file(&log_dir, buffer);
+                if !dumped.is_empty() {
+                    return dumped;
+                }
+            }
+        }
+        memory_dump(buffer)
     }
 
     fn memory_dump(&self, buffer: &[u8]) -> String {
-        memory_dump_impl(buffer)
+        memory_dump(buffer)
     }
 }
 
@@ -455,17 +332,11 @@ impl XlogBackend for RustBackend {
     }
 
     fn set_appender_mode(&self, mode: AppenderMode) {
-        self.appender_mode
-            .store(mode_to_i32(mode), Ordering::Relaxed);
+        let _ = self.engine.set_mode(appender_to_engine_mode(mode));
     }
 
-    fn flush(&self, _sync: bool) {
-        let mut runtime = match self.runtime.lock() {
-            Ok(rt) => rt,
-            Err(_) => return,
-        };
-        let _ = self.flush_pending_locked(&mut runtime, true);
-        let _ = self.housekeeping_locked(&runtime);
+    fn flush(&self, sync: bool) {
+        let _ = self.engine.flush(sync);
     }
 
     fn set_console_log_open(&self, open: bool) {
@@ -473,13 +344,11 @@ impl XlogBackend for RustBackend {
     }
 
     fn set_max_file_size(&self, max_bytes: i64) {
-        self.max_file_size.store(max_bytes, Ordering::Relaxed);
+        self.engine.set_max_file_size(max_bytes.max(0) as u64);
     }
 
     fn set_max_alive_time(&self, alive_seconds: i64) {
-        if alive_seconds >= 24 * 60 * 60 {
-            self.max_alive_time.store(alive_seconds, Ordering::Relaxed);
-        }
+        self.engine.set_max_alive_time(alive_seconds);
     }
 
     fn write_with_meta(
@@ -495,7 +364,12 @@ impl XlogBackend for RustBackend {
             return;
         }
 
-        let _ = self.write_impl(level, tag, file, func, line, msg);
+        if self.console_open.load(Ordering::Relaxed) {
+            write_console_line(to_console_level(level), msg);
+        }
+
+        let block = self.build_block(level, tag, file, func, line, msg);
+        let _ = self.engine.write_block(&block, level == LogLevel::Fatal);
     }
 }
 
@@ -523,21 +397,6 @@ fn i32_to_level(v: i32) -> LogLevel {
     }
 }
 
-fn mode_to_i32(mode: AppenderMode) -> i32 {
-    match mode {
-        AppenderMode::Async => 0,
-        AppenderMode::Sync => 1,
-    }
-}
-
-fn i32_to_mode(v: i32) -> AppenderMode {
-    if v == 1 {
-        AppenderMode::Sync
-    } else {
-        AppenderMode::Async
-    }
-}
-
 fn to_core_level(level: LogLevel) -> CoreLogLevel {
     match level {
         LogLevel::Verbose => CoreLogLevel::Verbose,
@@ -550,70 +409,30 @@ fn to_core_level(level: LogLevel) -> CoreLogLevel {
     }
 }
 
-fn current_tid() -> i64 {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        unsafe { libc::syscall(libc::SYS_gettid) as i64 }
-    }
-
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos"
-    ))]
-    {
-        let mut tid: u64 = 0;
-        unsafe {
-            libc::pthread_threadid_np(0, &mut tid);
-        }
-        tid as i64
-    }
-
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos"
-    )))]
-    {
-        -1
+fn appender_to_engine_mode(mode: AppenderMode) -> EngineMode {
+    match mode {
+        AppenderMode::Async => EngineMode::Async,
+        AppenderMode::Sync => EngineMode::Sync,
     }
 }
 
-fn memory_dump_impl(buffer: &[u8]) -> String {
-    if buffer.is_empty() {
-        return String::new();
+fn engine_to_appender_mode(mode: EngineMode) -> AppenderMode {
+    match mode {
+        EngineMode::Async => AppenderMode::Async,
+        EngineMode::Sync => AppenderMode::Sync,
     }
+}
 
-    let mut out = String::new();
-    out.push('\n');
-    out.push_str(&format!("{} bytes:\n", buffer.len()));
-
-    let mut offset = 0usize;
-    while offset < buffer.len() && out.len() < 4096 {
-        let end = std::cmp::min(offset + 16, buffer.len());
-        let slice = &buffer[offset..end];
-        for b in slice {
-            out.push_str(&format!("{:02x} ", b));
-        }
-        out.push('\n');
-        for b in slice {
-            let c = if (*b as char).is_ascii_graphic() {
-                *b as char
-            } else {
-                ' '
-            };
-            out.push(c);
-            out.push_str("  ");
-        }
-        out.push_str("\n\n");
-        offset += slice.len();
+fn to_console_level(level: LogLevel) -> ConsoleLevel {
+    match level {
+        LogLevel::Verbose => ConsoleLevel::Verbose,
+        LogLevel::Debug => ConsoleLevel::Debug,
+        LogLevel::Info => ConsoleLevel::Info,
+        LogLevel::Warn => ConsoleLevel::Warn,
+        LogLevel::Error => ConsoleLevel::Error,
+        LogLevel::Fatal => ConsoleLevel::Fatal,
+        LogLevel::None => ConsoleLevel::None,
     }
-
-    out
 }
 
 #[cfg(test)]
