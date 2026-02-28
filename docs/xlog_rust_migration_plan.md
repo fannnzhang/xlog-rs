@@ -10,6 +10,18 @@
 2. `formater.cc` 负责的是**日志文本行格式化**，xlog 的“二进制文件协议”实际在 `log_crypt.cc + log_base_buffer.cc + log_zlib/zstd_buffer.cc`。
 3. 兼容性验收不能只做“字节完全一致”，应以**官方解码结果一致**为主（压缩流字节可不同但可解码）。
 
+### 0.1 执行状态（截至 2026-02-28，分支 `codex/rust-migration-phase1`）
+
+- Phase 0：未开始。
+- Phase 1：已完成（commit: `643900d`）。
+  - 已落地后端抽象：`crates/xlog/src/backend/{mod.rs,ffi.rs,rust.rs}`。
+  - `xlog` API 已通过 backend trait 间接调用，实现 FFI/Rust 并行架构。
+- Phase 2：进行中（commit: `c1b6e10` + 当前增量）。
+  - 已完成 2A：`xlog-core` 协议/压缩/加密基础模块。
+  - 已完成 2B：`xlog` Rust backend 最小写入链路接入（可生成 `.xlog` block）。
+  - 未完成 2C：与官方解码脚本的系统化 fixture 对比。
+- Phase 3~6：未开始。
+
 ---
 
 ## 1. 现状基线（代码事实）
@@ -298,6 +310,12 @@ DoD：
 3. 实现 zlib/zstd 流式压缩。
 4. 实现 `secp256k1 + TEA` 加密流程。
 
+当前阶段拆分（落地顺序）：
+
+1. **Phase 2A（已完成）**：核心原语实现。
+2. **Phase 2B（已完成）**：`xlog` Rust backend 最小集成。
+3. **Phase 2C（待完成）**：官方解码兼容夹具与回归脚本。
+
 涉及文件：
 
 - 新增 `crates/xlog-core/src/record.rs`
@@ -305,7 +323,11 @@ DoD：
 - 新增 `crates/xlog-core/src/protocol.rs`
 - 新增 `crates/xlog-core/src/compress.rs`
 - 新增 `crates/xlog-core/src/crypto.rs`
+- 新增 `crates/xlog-core/tests/compress_roundtrip.rs`
 - 新增 `crates/xlog-core/tests/protocol_compat.rs`
+- 修改 `crates/xlog/src/backend/rust.rs`
+- 修改 `crates/xlog/src/backend/mod.rs`
+- 修改 `crates/xlog/Cargo.toml`
 
 实现要点：
 
@@ -319,11 +341,17 @@ DoD：
   - shared secret 前 16 bytes 作为 TEA key
   - async 仅加密 8-byte 对齐块
 - sync 模式保持 seq=0。
+- Rust backend 最小接入策略：
+  - 复用 `xlog-core` 的 formatter/protocol/compress/crypto 组件拼装完整 block。
+  - 先实现直接文件 append 路径，`oneshot_flush` 暂返回 `Unnecessary`。
+  - 默认 appender 与 named instance 注册先在 `xlog` 层用 `OnceLock + Mutex<HashMap<...>>` 落地，为 Phase 4 的引擎替换预留接口形态。
 
 DoD：
 
 - `protocol_compat` 覆盖 magic/seq/len/hour。
-- 生成文件可被官方脚本解码。
+- `compress_roundtrip` 覆盖 zlib/zstd 压缩回环。
+- `xlog` 在 `--features rust-backend` 下可完成写文件的单元测试。
+- 生成文件可被官方脚本解码（该项在 Phase 2C 收口）。
 
 ---
 

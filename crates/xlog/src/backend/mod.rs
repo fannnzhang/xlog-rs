@@ -68,14 +68,20 @@ pub(crate) trait XlogBackendProvider: Send + Sync {
 }
 
 pub(crate) fn provider() -> &'static dyn XlogBackendProvider {
-    #[cfg(feature = "ffi-backend")]
+    #[cfg(feature = "rust-backend")]
     {
-        // Phase 1: 所有调用先落到 FFI backend，保证行为不变。
-        ffi::provider()
+        return rust::provider();
     }
 
-    #[cfg(not(feature = "ffi-backend"))]
+    #[cfg(all(not(feature = "rust-backend"), feature = "ffi-backend"))]
     {
-        compile_error!("xlog requires at least one backend; enable the `ffi-backend` feature");
+        return ffi::provider();
+    }
+
+    #[cfg(not(any(feature = "ffi-backend", feature = "rust-backend")))]
+    {
+        compile_error!(
+            "xlog requires at least one backend; enable `ffi-backend` or `rust-backend`"
+        );
     }
 }
