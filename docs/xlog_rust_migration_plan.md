@@ -22,24 +22,32 @@
   - 已完成 2C-1：fixture 生成与 no-crypt 解码对比脚本。
   - 已完成 2C-2：crypt 用例在 Python2 官方解码环境下的回归固化（`scripts/xlog/setup_py2_decoder_env.sh` + `scripts/xlog/run_phase2c2_official.sh`）。
 - Phase 3：已完成（commit: `3558c76`）。
-- Phase 4：已完成（commit: `2586d81` + 当前增量 Review 收口）。
+- Phase 4：基本完成（主体已落地，仍有少量行为/接口对齐项待收口）。
 - Phase 5：进行中（当前增量）。
   - `xlog` 默认 feature 已切换到 `rust-backend`，并保留 `ffi-backend` 紧急回退。
   - JNI/UniFFI/NAPI 绑定层均改为可切换 `rust-backend` / `ffi-backend`。
   - 新增 `scripts/xlog/run_phase5_regression.sh` + `crates/xlog/examples/bench_backend.rs` 统一执行回归与性能对比。
-  - 已具备性能比值产物与可选门槛校验；Review 阻断项已关闭，性能优化持续中。
+  - 已具备性能比值产物与可选门槛校验；兼容性剩余项集中在 async block 模型与接口覆盖。
 - Phase 6：未开始。
 
 ### 0.2 Review 收口清单（截至 2026-03-02）
 
-基于 `docs/rust_migration_review.md`，原兼容项已全部关闭（截至 2026-03-02）：
+基于 `docs/rust_migration_review.md`，本轮已收敛的关键项：
 
-1. `backend/rust.rs`：`maintid` 改为主线程 tid 缓存。
+1. `appender_engine.rs`：启动即排空 recovered mmap；flush 信号去重；`Async -> Sync` 改为非阻塞触发 flush。
 2. `backend/rust.rs`：sync + crypt magic/payload 语义已对齐。
-3. `formatter.rs`：已补齐 body 截断策略。
-4. `appender_engine.rs` + `backend/rust.rs`：已补齐 4/5 高水位告警注入路径。
-5. `platform_console.rs`：Android 已切换 `__android_log_write`。
-6. `oneshot.rs`：截断 mmap 容错已支持（`read_to_end` + 补零）。
+3. `buffer.rs`：torn tail 场景恢复策略放宽，尽量保留可恢复前缀。
+4. `file_manager.rs`：append/copy 失败回滚、时钟回拨复用上次文件、1GiB 阈值边界对齐、空 prefix 语义对齐。
+5. `platform_console.rs` + `backend/rust.rs`：console 输出补齐 metadata，Android tag 改为逐条 tag，Apple `set_console_fun` 已接入。
+6. `oneshot.rs`：改为 exact-size mmap 读取语义（截断返回 `ReadFailed`）。
+7. `backend/rust.rs`：非法 pubkey 降级 no-crypt；async seq 改为全局；`dump` 语义改为无默认 appender 返回空串；default appender open 幂等。
+
+仍待收口（详见 `docs/rust_migration_review.md`）：
+
+1. async block 仍非 C++ 的“单 pending block 流式模型”。
+2. zstd 流式参数（含 `windowLog=16`）未完全复刻。
+3. `traceLog` 与 `XloggerWrite(instance_ptr==0)` 等 raw info 入口尚未完整暴露。
+4. UniFFI/NAPI 绑定覆盖仍小于 C++ 接口面。
 
 ---
 

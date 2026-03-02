@@ -177,13 +177,15 @@ pub fn recover_blocks(raw: &[u8]) -> RecoveryResult {
             continue;
         }
 
-        if raw[payload_end..].iter().all(|b| *b == 0) {
-            // Recover Mars mmap3 pending buffer: header+payload stored without tailer.
-            out.extend_from_slice(&raw[offset..payload_end]);
-            out.push(MAGIC_END);
-            recovered_pending_block = true;
-            offset = payload_end;
-        }
+        // Recover pending block without tailer.
+        //
+        // Mars C++ `LogCrypt::Fix` trusts header length and keeps the valid prefix
+        // even when trailing bytes are dirty/torn, so recovery should not require a
+        // zero-only remainder.
+        out.extend_from_slice(&raw[offset..payload_end]);
+        out.push(MAGIC_END);
+        recovered_pending_block = true;
+        offset = payload_end;
         break;
     }
 
@@ -245,6 +247,20 @@ mod tests {
 
         let recovered = recover_blocks(&pending);
         assert_eq!(recovered.bytes, full);
+    }
+
+    #[test]
+    fn recover_pending_block_even_with_dirty_tail_bytes() {
+        let payload = b"hello";
+        let full = make_block(payload);
+        let mut pending = full[..full.len() - 1].to_vec();
+        pending.extend_from_slice(b"dirty-tail");
+        pending.resize(full.len() + 16, 0);
+
+        let recovered = recover_blocks(&pending);
+        assert_eq!(recovered.bytes, full);
+        assert!(recovered.recovered_pending_block);
+        assert!(recovered.dropped_nonzero_tail_bytes >= b"dirty-tail".len());
     }
 
     #[test]

@@ -1,7 +1,8 @@
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use chrono::{Datelike, Duration as ChronoDuration, Local};
@@ -41,6 +42,13 @@ pub struct FileManager {
     cache_dir: Option<PathBuf>,
     name_prefix: String,
     cache_days: i32,
+    runtime: Arc<Mutex<RuntimeState>>,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeState {
+    last_append_time: Option<i64>,
+    last_append_path: Option<PathBuf>,
 }
 
 impl FileManager {
@@ -68,6 +76,7 @@ impl FileManager {
             cache_dir,
             name_prefix,
             cache_days,
+            runtime: Arc::new(Mutex::new(RuntimeState::default())),
         })
     }
 
@@ -93,12 +102,7 @@ impl FileManager {
     }
 
     pub fn filepaths_from_timespan(&self, timespan: i32, prefix: &str) -> Vec<String> {
-        let use_prefix = if prefix.is_empty() {
-            &self.name_prefix
-        } else {
-            prefix
-        };
-        let file_prefix = make_date_prefix(use_prefix, timespan);
+        let file_prefix = make_date_prefix(prefix, timespan);
 
         let mut out = Vec::new();
         out.extend(self.list_existing_files(&self.log_dir, &file_prefix));
@@ -115,20 +119,15 @@ impl FileManager {
         prefix: &str,
         max_file_size: u64,
     ) -> Vec<String> {
-        let use_prefix = if prefix.is_empty() {
-            &self.name_prefix
-        } else {
-            prefix
-        };
         let now = Local::now() - ChronoDuration::days(timespan as i64);
-        let log_path = self.make_path_for_time(now, &self.log_dir, use_prefix, max_file_size);
+        let log_path = self.make_path_for_time(now, &self.log_dir, prefix, max_file_size);
 
         if self.cache_dir.is_none() {
             return vec![log_path.to_string_lossy().to_string()];
         }
 
         let cache_dir = self.cache_dir.as_ref().expect("checked is_some");
-        let cache_path = self.make_path_for_time(now, cache_dir, use_prefix, max_file_size);
+        let cache_path = self.make_path_for_time(now, cache_dir, prefix, max_file_size);
 
         let mut out = Vec::new();
         if log_path.exists() {
@@ -156,13 +155,13 @@ impl FileManager {
         if self.cache_dir.is_none() {
             let now = Local::now();
             let path =
-                self.make_path_for_time(now, &self.log_dir, &self.name_prefix, max_file_size);
+                self.select_append_path(now, &self.log_dir, &self.name_prefix, max_file_size);
             return append_bytes(&path, bytes);
         }
 
         let cache_dir = self.cache_dir.as_ref().expect("cache_dir is_some");
         let now = Local::now();
-        let cache_path = self.make_path_for_time(now, cache_dir, &self.name_prefix, max_file_size);
+        let cache_path = self.select_append_path(now, cache_dir, &self.name_prefix, max_file_size);
         let cache_logs = self.should_cache_logs(now, max_file_size);
 
         if cache_logs || cache_path.exists() {
@@ -172,7 +171,7 @@ impl FileManager {
             }
 
             let log_path =
-                self.make_path_for_time(now, &self.log_dir, &self.name_prefix, max_file_size);
+                self.select_append_path(now, &self.log_dir, &self.name_prefix, max_file_size);
             append_file_to_file(&cache_path, &log_path)?;
             fs::remove_file(&cache_path)
                 .map_err(|e| FileManagerError::RemoveFile(cache_path, e))?;
@@ -180,7 +179,7 @@ impl FileManager {
         }
 
         let log_path =
-            self.make_path_for_time(now, &self.log_dir, &self.name_prefix, max_file_size);
+            self.select_append_path(now, &self.log_dir, &self.name_prefix, max_file_size);
         match append_bytes(&log_path, bytes) {
             Ok(()) => Ok(()),
             Err(_) => append_bytes(&cache_path, bytes),
@@ -322,9 +321,33 @@ impl FileManager {
         }
 
         match available_space(cache_dir) {
-            Ok(bytes) => bytes > CACHE_AVAILABLE_THRESHOLD_BYTES,
+            Ok(bytes) => bytes >= CACHE_AVAILABLE_THRESHOLD_BYTES,
             Err(_) => false,
         }
+    }
+
+    fn select_append_path(
+        &self,
+        now: chrono::DateTime<Local>,
+        dir: &Path,
+        prefix: &str,
+        max_file_size: u64,
+    ) -> PathBuf {
+        let now_ts = now.timestamp();
+        if let Ok(mut runtime) = self.runtime.lock() {
+            if let Some(last_ts) = runtime.last_append_time {
+                if now_ts < last_ts {
+                    if let Some(path) = runtime.last_append_path.clone() {
+                        return path;
+                    }
+                }
+            }
+            let path = self.make_path_for_time(now, dir, prefix, max_file_size);
+            runtime.last_append_time = Some(now_ts);
+            runtime.last_append_path = Some(path.clone());
+            return path;
+        }
+        self.make_path_for_time(now, dir, prefix, max_file_size)
     }
 
     fn make_path_for_time(
@@ -442,8 +465,19 @@ fn append_bytes(path: &Path, bytes: &[u8]) -> Result<(), FileManagerError> {
         .append(true)
         .open(path)
         .map_err(|e| FileManagerError::OpenFile(path.to_path_buf(), e))?;
-    file.write_all(bytes)
-        .map_err(|e| FileManagerError::WriteFile(path.to_path_buf(), e))
+    let before_len = file
+        .metadata()
+        .map_err(|e| FileManagerError::Metadata(path.to_path_buf(), e))?
+        .len();
+    if let Err(e) = file.write_all(bytes) {
+        rollback_file_to_len(&mut file, before_len);
+        return Err(FileManagerError::WriteFile(path.to_path_buf(), e));
+    }
+    if let Err(e) = file.flush() {
+        rollback_file_to_len(&mut file, before_len);
+        return Err(FileManagerError::WriteFile(path.to_path_buf(), e));
+    }
+    Ok(())
 }
 
 fn append_file_to_file(src: &Path, dst: &Path) -> Result<(), FileManagerError> {
@@ -467,21 +501,48 @@ fn append_file_to_file(src: &Path, dst: &Path) -> Result<(), FileManagerError> {
         .append(true)
         .open(dst)
         .map_err(|e| FileManagerError::OpenFile(dst.to_path_buf(), e))?;
+    let dst_before_len = dst_file
+        .metadata()
+        .map_err(|e| FileManagerError::Metadata(dst.to_path_buf(), e))?
+        .len();
 
     let mut buf = [0u8; 4096];
+    let mut copied = 0u64;
     loop {
-        let n = src_file
-            .read(&mut buf)
-            .map_err(|e| FileManagerError::ReadFile(src.to_path_buf(), e))?;
+        let n = match src_file.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                rollback_file_to_len(&mut dst_file, dst_before_len);
+                return Err(FileManagerError::ReadFile(src.to_path_buf(), e));
+            }
+        };
         if n == 0 {
             break;
         }
-        dst_file
-            .write_all(&buf[..n])
-            .map_err(|e| FileManagerError::WriteFile(dst.to_path_buf(), e))?;
+        if let Err(e) = dst_file.write_all(&buf[..n]) {
+            rollback_file_to_len(&mut dst_file, dst_before_len);
+            return Err(FileManagerError::WriteFile(dst.to_path_buf(), e));
+        }
+        copied = copied.saturating_add(n as u64);
+    }
+    if copied < src_meta.len() {
+        rollback_file_to_len(&mut dst_file, dst_before_len);
+        return Err(FileManagerError::WriteFile(
+            dst.to_path_buf(),
+            std::io::Error::new(std::io::ErrorKind::WriteZero, "partial append"),
+        ));
+    }
+    if let Err(e) = dst_file.flush() {
+        rollback_file_to_len(&mut dst_file, dst_before_len);
+        return Err(FileManagerError::WriteFile(dst.to_path_buf(), e));
     }
 
     Ok(())
+}
+
+fn rollback_file_to_len(file: &mut File, target_len: u64) {
+    let _ = file.set_len(target_len);
+    let _ = file.seek(SeekFrom::Start(target_len));
 }
 
 fn file_mtime(path: &Path) -> Result<SystemTime, FileManagerError> {

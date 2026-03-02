@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -49,6 +49,7 @@ pub struct AppenderEngine {
     mode: AtomicI32,
     state: Arc<Mutex<EngineState>>,
     tx: Sender<EngineCommand>,
+    pending_async_flush: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -66,17 +67,25 @@ impl AppenderEngine {
             max_file_size,
             max_alive_time: max_alive_time.max(MIN_LOG_ALIVE_SECONDS),
         }));
+        if let Ok(mut state_guard) = state.lock() {
+            // Keep parity with C++ appender startup behavior: drain recovered mmap data
+            // into logfile immediately instead of waiting for next write/flush.
+            let _ = flush_pending_locked(&mut state_guard, false);
+        }
         let (tx, rx) = unbounded();
+        let pending_async_flush = Arc::new(AtomicBool::new(false));
         let worker_state = Arc::clone(&state);
+        let worker_pending_flag = Arc::clone(&pending_async_flush);
         let worker = thread::Builder::new()
             .name("xlog-appender-engine".to_string())
-            .spawn(move || run_worker_loop(worker_state, rx))
+            .spawn(move || run_worker_loop(worker_state, rx, worker_pending_flag))
             .expect("spawn appender engine thread");
 
         Self {
             mode: AtomicI32::new(mode_to_i32(mode)),
             state,
             tx,
+            pending_async_flush,
             worker: Mutex::new(Some(worker)),
         }
     }
@@ -88,7 +97,7 @@ impl AppenderEngine {
     pub fn set_mode(&self, mode: EngineMode) -> Result<(), AppenderEngineError> {
         let old = i32_to_mode(self.mode.swap(mode_to_i32(mode), Ordering::Relaxed));
         if old == EngineMode::Async && mode == EngineMode::Sync {
-            self.flush(true)?;
+            self.request_flush(false, true)?;
         }
         Ok(())
     }
@@ -221,12 +230,18 @@ impl AppenderEngine {
             return Ok(());
         }
 
+        if self.pending_async_flush.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
         self.tx
             .send(EngineCommand::Flush {
                 move_file,
                 ack: None,
             })
-            .map_err(|_| AppenderEngineError::ChannelClosed)
+            .map_err(|_| {
+                self.pending_async_flush.store(false, Ordering::Release);
+                AppenderEngineError::ChannelClosed
+            })
     }
 }
 
@@ -243,10 +258,15 @@ impl Drop for AppenderEngine {
     }
 }
 
-fn run_worker_loop(state: Arc<Mutex<EngineState>>, rx: Receiver<EngineCommand>) {
+fn run_worker_loop(
+    state: Arc<Mutex<EngineState>>,
+    rx: Receiver<EngineCommand>,
+    pending_async_flush: Arc<AtomicBool>,
+) {
     loop {
         match rx.recv_timeout(ASYNC_FLUSH_TIMEOUT) {
             Ok(EngineCommand::Flush { move_file, ack }) => {
+                pending_async_flush.store(false, Ordering::Release);
                 let _ = state
                     .lock()
                     .map_err(|_| ())
@@ -256,6 +276,7 @@ fn run_worker_loop(state: Arc<Mutex<EngineState>>, rx: Receiver<EngineCommand>) 
                 }
             }
             Ok(EngineCommand::Stop { ack }) => {
+                pending_async_flush.store(false, Ordering::Release);
                 let _ = state
                     .lock()
                     .map_err(|_| ())

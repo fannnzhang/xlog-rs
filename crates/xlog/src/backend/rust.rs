@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use chrono::Local;
@@ -11,8 +11,15 @@ use mars_xlog_core::file_manager::FileManager;
 use mars_xlog_core::oneshot::{
     oneshot_flush as core_oneshot_flush, FileIoAction as CoreFileIoAction,
 };
+#[cfg(any(
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "watchos"
+))]
+use mars_xlog_core::platform_console::{set_apple_console_fun, AppleConsoleFun};
 use mars_xlog_core::platform_console::{write_console_line, ConsoleLevel};
-use mars_xlog_core::platform_tid::current_tid;
+use mars_xlog_core::platform_tid::{current_tid, main_tid};
 use mars_xlog_core::protocol::{
     select_magic, AppendMode, CompressionKind, LogHeader, SeqGenerator, MAGIC_END,
 };
@@ -43,13 +50,14 @@ struct RustBackend {
     level: AtomicI32,
     console_open: AtomicBool,
     async_high_watermark_warned: AtomicBool,
-    seq: SeqGenerator,
     cipher: EcdhTeaCipher,
     engine: AppenderEngine,
 }
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
-static MAIN_TID: OnceLock<i64> = OnceLock::new();
+static GLOBAL_MAX_FILE_SIZE: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_MAX_ALIVE_TIME: AtomicI64 = AtomicI64::new(0);
+static GLOBAL_CONSOLE_OPEN: AtomicBool = AtomicBool::new(false);
 
 const ASYNC_WARNING_THRESHOLD_NUM: usize = 4;
 const ASYNC_WARNING_THRESHOLD_DEN: usize = 5;
@@ -62,8 +70,9 @@ fn registry() -> &'static InstanceRegistry<RustBackend> {
     REGISTRY.get_or_init(InstanceRegistry::new)
 }
 
-fn main_tid() -> i64 {
-    *MAIN_TID.get_or_init(current_tid)
+fn global_async_seq() -> &'static SeqGenerator {
+    static SEQ: OnceLock<SeqGenerator> = OnceLock::new();
+    SEQ.get_or_init(SeqGenerator::default)
 }
 
 impl RustBackend {
@@ -73,9 +82,10 @@ impl RustBackend {
         }
 
         let cipher = match config.pub_key.as_deref() {
-            Some(key) if !key.is_empty() => {
-                EcdhTeaCipher::new(key).map_err(|_| XlogError::InitFailed)?
-            }
+            Some(key) if !key.is_empty() => EcdhTeaCipher::new(key).unwrap_or_else(|_| {
+                // Keep parity with C++: invalid pubkey falls back to no-crypt.
+                EcdhTeaCipher::disabled()
+            }),
             _ => EcdhTeaCipher::disabled(),
         };
 
@@ -106,7 +116,6 @@ impl RustBackend {
             async_high_watermark_warned: AtomicBool::new(false),
             level: AtomicI32::new(level_to_i32(level)),
             config,
-            seq: SeqGenerator::default(),
             cipher,
             engine,
         })
@@ -120,7 +129,7 @@ impl RustBackend {
         func: &str,
         line: u32,
         msg: &str,
-    ) -> Vec<u8> {
+    ) -> Option<Vec<u8>> {
         let mode = engine_to_appender_mode(self.engine.mode());
         let compress = self.config.compress_mode;
 
@@ -128,7 +137,7 @@ impl RustBackend {
         let pid = std::process::id() as i64;
         let tid = current_tid();
         let maintid = main_tid();
-        let is_crypt = self.cipher.enabled() && mode == AppenderMode::Async;
+        let is_crypt = self.cipher.enabled();
 
         let record = LogRecord {
             level: to_core_level(level),
@@ -149,15 +158,15 @@ impl RustBackend {
                 CompressMode::Zlib => {
                     let mut c = ZlibStreamCompressor::default();
                     let mut out = Vec::new();
-                    let _ = c.compress_chunk(line.as_bytes(), &mut out);
-                    let _ = c.flush(&mut out);
+                    c.compress_chunk(line.as_bytes(), &mut out).ok()?;
+                    c.flush(&mut out).ok()?;
                     out
                 }
                 CompressMode::Zstd => {
                     let mut c = ZstdChunkCompressor::new(self.config.compress_level);
                     let mut out = Vec::new();
-                    let _ = c.compress_chunk(line.as_bytes(), &mut out);
-                    let _ = c.flush(&mut out);
+                    c.compress_chunk(line.as_bytes(), &mut out).ok()?;
+                    c.flush(&mut out).ok()?;
                     out
                 }
             },
@@ -183,11 +192,11 @@ impl RustBackend {
             magic: select_magic(compression_kind, append_mode, is_crypt),
             seq: match mode {
                 AppenderMode::Sync => SeqGenerator::sync_seq(),
-                AppenderMode::Async => self.seq.next_async(),
+                AppenderMode::Async => global_async_seq().next_async(),
             },
             begin_hour: chrono::Timelike::hour(&now) as u8,
             end_hour: chrono::Timelike::hour(&now) as u8,
-            len: payload.len() as u32,
+            len: u32::try_from(payload.len()).ok()?,
             client_pubkey: if is_crypt {
                 self.cipher.client_pubkey()
             } else {
@@ -199,7 +208,7 @@ impl RustBackend {
         block.extend_from_slice(&header.encode());
         block.extend_from_slice(&payload);
         block.push(MAGIC_END);
-        block
+        Some(block)
     }
 
     fn maybe_emit_async_high_watermark_warning(&self) {
@@ -232,14 +241,16 @@ impl RustBackend {
         let warning = format!(
             "sg_buffer_async.Length() >= BUFFER_BLOCK_LENTH*4/5, len:{len}, capacity:{capacity}"
         );
-        let block = self.build_block(
+        let Some(block) = self.build_block(
             LogLevel::Fatal,
             ASYNC_WARNING_TAG,
             ASYNC_WARNING_FILE,
             ASYNC_WARNING_FUNC,
             0,
             &warning,
-        );
+        ) else {
+            return;
+        };
         let _ = self.engine.write_block(&block, true);
     }
 
@@ -271,7 +282,17 @@ impl XlogBackendProvider for RustBackendProvider {
     }
 
     fn appender_open(&self, config: &XlogConfig, level: LogLevel) -> Result<(), XlogError> {
+        if let Some(default) = registry().default_instance() {
+            default.set_level(level);
+            return Ok(());
+        }
         let backend = Arc::new(RustBackend::new(config.clone(), level)?);
+        let max_file_size = GLOBAL_MAX_FILE_SIZE.load(Ordering::Relaxed) as i64;
+        let max_alive_time = GLOBAL_MAX_ALIVE_TIME.load(Ordering::Relaxed);
+        let console_open = GLOBAL_CONSOLE_OPEN.load(Ordering::Relaxed);
+        backend.set_max_file_size(max_file_size);
+        backend.set_max_alive_time(max_alive_time);
+        backend.set_console_log_open(console_open);
         registry().set_default(backend);
         Ok(())
     }
@@ -281,10 +302,15 @@ impl XlogBackendProvider for RustBackendProvider {
     }
 
     fn flush_all(&self, sync: bool) {
+        let mut default_id = None;
         if let Some(default) = registry().default_instance() {
+            default_id = Some(default.id);
             default.flush(sync);
         }
         registry().for_each_live(|backend| {
+            if default_id == Some(backend.id) {
+                return;
+            }
             backend.flush(sync);
         });
     }
@@ -295,8 +321,13 @@ impl XlogBackendProvider for RustBackendProvider {
         target_os = "tvos",
         target_os = "watchos"
     ))]
-    fn set_console_fun(&self, _fun: ConsoleFun) {
-        // no-op in rust backend for now
+    fn set_console_fun(&self, fun: ConsoleFun) {
+        let core_fun = match fun {
+            ConsoleFun::Printf => AppleConsoleFun::Printf,
+            ConsoleFun::NSLog => AppleConsoleFun::NsLog,
+            ConsoleFun::OSLog => AppleConsoleFun::OsLog,
+        };
+        set_apple_console_fun(core_fun);
     }
 
     fn current_log_path(&self) -> Option<String> {
@@ -342,7 +373,7 @@ impl XlogBackendProvider for RustBackendProvider {
             .get(&config.name_prefix)
             .or_else(|| registry().default_instance())
             .map(|b| b.engine.max_file_size())
-            .unwrap_or(0);
+            .unwrap_or_else(|| GLOBAL_MAX_FILE_SIZE.load(Ordering::Relaxed));
 
         let action = core_oneshot_flush(&file_manager, DEFAULT_BUFFER_BLOCK_LEN, max_file_size);
         Ok(match action {
@@ -358,15 +389,13 @@ impl XlogBackendProvider for RustBackendProvider {
     }
 
     fn dump(&self, buffer: &[u8]) -> String {
-        if let Some(default) = registry().default_instance() {
-            if let Some(log_dir) = default.engine.log_dir() {
-                let dumped = dump_to_file(&log_dir, buffer);
-                if !dumped.is_empty() {
-                    return dumped;
-                }
-            }
-        }
-        memory_dump(buffer)
+        let Some(default) = registry().default_instance() else {
+            return String::new();
+        };
+        let Some(log_dir) = default.engine.log_dir() else {
+            return String::new();
+        };
+        dump_to_file(&log_dir, buffer)
     }
 
     fn memory_dump(&self, buffer: &[u8]) -> String {
@@ -405,14 +434,18 @@ impl XlogBackend for RustBackend {
 
     fn set_console_log_open(&self, open: bool) {
         self.console_open.store(open, Ordering::Relaxed);
+        GLOBAL_CONSOLE_OPEN.store(open, Ordering::Relaxed);
     }
 
     fn set_max_file_size(&self, max_bytes: i64) {
-        self.engine.set_max_file_size(max_bytes.max(0) as u64);
+        let v = max_bytes.max(0) as u64;
+        self.engine.set_max_file_size(v);
+        GLOBAL_MAX_FILE_SIZE.store(v, Ordering::Relaxed);
     }
 
     fn set_max_alive_time(&self, alive_seconds: i64) {
         self.engine.set_max_alive_time(alive_seconds);
+        GLOBAL_MAX_ALIVE_TIME.store(alive_seconds, Ordering::Relaxed);
     }
 
     fn write_with_meta(
@@ -429,10 +462,12 @@ impl XlogBackend for RustBackend {
         }
 
         if self.console_open.load(Ordering::Relaxed) {
-            write_console_line(to_console_level(level), msg);
+            write_console_line(to_console_level(level), tag, file, func, line, msg);
         }
 
-        let block = self.build_block(level, tag, file, func, line, msg);
+        let Some(block) = self.build_block(level, tag, file, func, line, msg) else {
+            return;
+        };
         let _ = self.engine.write_block(&block, level == LogLevel::Fatal);
         self.maybe_emit_async_high_watermark_warning();
     }
@@ -504,9 +539,7 @@ fn to_console_level(level: LogLevel) -> ConsoleLevel {
 mod tests {
     use std::fs;
 
-    use mars_xlog_core::protocol::{
-        LogHeader, HEADER_LEN, MAGIC_SYNC_NO_CRYPT_ZLIB_START, TAILER_LEN,
-    };
+    use mars_xlog_core::protocol::{LogHeader, HEADER_LEN, MAGIC_SYNC_ZLIB_START, TAILER_LEN};
 
     use super::RustBackend;
     use crate::backend::XlogBackend;
@@ -553,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_mode_with_pubkey_uses_no_crypt_magic_and_plain_payload() {
+    fn sync_mode_with_pubkey_uses_crypt_magic_and_plain_payload() {
         let root = std::env::temp_dir().join(format!(
             "xlog-rust-backend-sync-crypt-{}",
             std::process::id()
@@ -566,10 +599,12 @@ mod tests {
             .pub_key(TEST_SERVER_PUBKEY_HEX);
         let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
 
-        let block = backend.build_block(LogLevel::Info, "tag", "main.rs", "f", 7, "plain-sync");
+        let block = backend
+            .build_block(LogLevel::Info, "tag", "main.rs", "f", 7, "plain-sync")
+            .unwrap();
         let (header, payload) = parse_block_payload(&block);
-        assert_eq!(header.magic, MAGIC_SYNC_NO_CRYPT_ZLIB_START);
-        assert_eq!(header.client_pubkey, [0; 64]);
+        assert_eq!(header.magic, MAGIC_SYNC_ZLIB_START);
+        assert_ne!(header.client_pubkey, [0; 64]);
 
         let line = std::str::from_utf8(payload).unwrap();
         assert!(line.contains("plain-sync"));
@@ -586,7 +621,9 @@ mod tests {
         let cfg = XlogConfig::new(root.to_string_lossy().to_string(), "demo-maintid")
             .mode(AppenderMode::Sync);
         let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
-        let block = backend.build_block(LogLevel::Info, "tag", "main.rs", "f", 9, "maintid");
+        let block = backend
+            .build_block(LogLevel::Info, "tag", "main.rs", "f", 9, "maintid")
+            .unwrap();
         let (_header, payload) = parse_block_payload(&block);
         let line = std::str::from_utf8(payload).unwrap();
 

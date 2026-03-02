@@ -1,5 +1,29 @@
 #[cfg(target_os = "android")]
 use std::ffi::CString;
+#[cfg(any(
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "watchos"
+))]
+use std::sync::atomic::{AtomicU8, Ordering};
+
+#[cfg(any(
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "watchos"
+))]
+use chrono::Local;
+
+use crate::formatter::extract_file_name;
+#[cfg(any(
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "watchos"
+))]
+use crate::platform_tid::{current_tid, main_tid};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ConsoleLevel {
@@ -12,31 +36,158 @@ pub enum ConsoleLevel {
     None,
 }
 
-pub fn write_console_line(level: ConsoleLevel, line: &str) {
-    if line.is_empty() {
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum AppleConsoleFun {
+    Printf = 0,
+    NsLog = 1,
+    OsLog = 2,
+}
+
+#[cfg(any(
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "watchos"
+))]
+static APPLE_CONSOLE_FUN: AtomicU8 = AtomicU8::new(AppleConsoleFun::OsLog as u8);
+
+#[cfg(any(
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "watchos"
+))]
+pub fn set_apple_console_fun(fun: AppleConsoleFun) {
+    APPLE_CONSOLE_FUN.store(fun as u8, Ordering::Relaxed);
+}
+
+#[cfg(not(any(
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "tvos",
+    target_os = "watchos"
+)))]
+pub fn set_apple_console_fun(_fun: AppleConsoleFun) {}
+
+pub fn write_console_line(
+    level: ConsoleLevel,
+    tag: &str,
+    file: &str,
+    func: &str,
+    line: u32,
+    msg: &str,
+) {
+    if msg.is_empty() {
         return;
     }
-    #[cfg(not(target_os = "android"))]
-    let _ = level;
 
     #[cfg(target_os = "android")]
     {
-        write_android_line(level, line);
+        write_android_line(level, tag, file, func, line, msg);
+        return;
     }
 
     #[cfg(not(target_os = "android"))]
     {
-        eprintln!("{line}");
+        let file_name = extract_file_name(file);
+        let func_name = if func.is_empty() { "" } else { func };
+
+        #[cfg(any(
+            target_os = "ios",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "watchos"
+        ))]
+        {
+            let mode = APPLE_CONSOLE_FUN.load(Ordering::Relaxed);
+            if mode == AppleConsoleFun::OsLog as u8 {
+                eprintln!("[{file_name}:{line}, {func_name}][{msg}");
+                return;
+            }
+            if mode == AppleConsoleFun::NsLog as u8 {
+                eprintln!(
+                    "[{}][{}][{}:{}, {}][{}",
+                    level_short(level),
+                    tag,
+                    file_name,
+                    line,
+                    func_name,
+                    msg
+                );
+                return;
+            }
+            let now = Local::now();
+            let pid = std::process::id() as i64;
+            let tid = current_tid();
+            let maintid = main_tid();
+            let tid_suffix = if tid == maintid { "*" } else { "" };
+            eprintln!(
+                "[{}][{}][{}, {}{}][{}][{}:{}, {}][{}",
+                level_short(level),
+                now.format("%Y-%m-%d %z %H:%M:%S%.3f"),
+                pid,
+                tid,
+                tid_suffix,
+                tag,
+                file_name,
+                line,
+                func_name,
+                msg
+            );
+            return;
+        }
+
+        #[cfg(not(any(
+            target_os = "ios",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "watchos"
+        )))]
+        {
+            eprintln!(
+                "[{}][{}][{}:{}, {}][{}",
+                level_short(level),
+                tag,
+                file_name,
+                line,
+                func_name,
+                msg
+            );
+        }
+    }
+}
+
+fn level_short(level: ConsoleLevel) -> &'static str {
+    match level {
+        ConsoleLevel::Verbose => "V",
+        ConsoleLevel::Debug => "D",
+        ConsoleLevel::Info => "I",
+        ConsoleLevel::Warn => "W",
+        ConsoleLevel::Error => "E",
+        ConsoleLevel::Fatal => "F",
+        ConsoleLevel::None => "N",
     }
 }
 
 #[cfg(target_os = "android")]
-fn write_android_line(level: ConsoleLevel, line: &str) {
-    const TAG: &[u8] = b"mars-xlog\0";
-    let msg = line.replace('\0', " ");
-    let c_msg = CString::new(msg).expect("nul bytes replaced");
+fn write_android_line(
+    level: ConsoleLevel,
+    tag: &str,
+    file: &str,
+    func: &str,
+    line: u32,
+    msg: &str,
+) {
+    let file_name = extract_file_name(file);
+    let func_name = if func.is_empty() { "" } else { func };
+    let mut out = format!("[{file_name}:{line}, {func_name}]:{msg}");
+    out = out.replace('\0', " ");
+    let tag = if tag.is_empty() { "mars-xlog" } else { tag };
+    let safe_tag = tag.replace('\0', " ");
+    let c_tag = CString::new(safe_tag).expect("nul bytes replaced");
+    let c_msg = CString::new(out).expect("nul bytes replaced");
     unsafe {
-        __android_log_write(android_priority(level), TAG.as_ptr().cast(), c_msg.as_ptr());
+        __android_log_write(android_priority(level), c_tag.as_ptr(), c_msg.as_ptr());
     }
 }
 

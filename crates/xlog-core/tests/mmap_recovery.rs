@@ -21,7 +21,7 @@ fn make_block(seq: u16, payload: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn mmap_recovery_keeps_valid_prefix_only() {
+fn mmap_recovery_salvages_tailer_torn_block() {
     let dir = tempfile::tempdir().unwrap();
     let manager = FileManager::new(dir.path().to_path_buf(), None, "demo".to_string(), 0).unwrap();
     let mmap_path = manager.mmap_path();
@@ -41,9 +41,11 @@ fn mmap_recovery_keeps_valid_prefix_only() {
 
     let mut reopened =
         PersistentBuffer::open_with_capacity(&mmap_path, DEFAULT_BUFFER_BLOCK_LEN).unwrap();
-    assert_eq!(reopened.len(), b1.len());
+    assert_eq!(reopened.len(), b1.len() + b2.len());
     let recovered = reopened.take_all().unwrap();
-    assert_eq!(recovered, b1);
+    let mut expected = b1;
+    expected.extend_from_slice(&b2);
+    assert_eq!(recovered, expected);
 }
 
 #[test]

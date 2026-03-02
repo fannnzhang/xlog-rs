@@ -54,7 +54,7 @@ fn oneshot_flush_writes_recovered_bytes_once() {
 }
 
 #[test]
-fn oneshot_flush_accepts_truncated_mmap_file() {
+fn oneshot_flush_rejects_truncated_mmap_file() {
     let log_dir = tempfile::tempdir().unwrap();
     let manager =
         FileManager::new(log_dir.path().to_path_buf(), None, "oneshot".to_string(), 0).unwrap();
@@ -65,7 +65,7 @@ fn oneshot_flush_accepts_truncated_mmap_file() {
 
     assert_eq!(
         oneshot_flush(&manager, DEFAULT_BUFFER_BLOCK_LEN, 0),
-        FileIoAction::Success
+        FileIoAction::ReadFailed
     );
 
     let files: Vec<_> = fs::read_dir(log_dir.path())
@@ -74,6 +74,5 @@ fn oneshot_flush_accepts_truncated_mmap_file() {
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("xlog"))
         .collect();
-    assert_eq!(files.len(), 1);
-    assert_eq!(fs::read(&files[0]).unwrap(), block);
+    assert!(files.is_empty());
 }

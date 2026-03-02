@@ -74,6 +74,36 @@ fn async_flush_sync_ack_persists_data() {
 }
 
 #[test]
+fn startup_drains_recovered_mmap_bytes_to_logfile() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager =
+        FileManager::new(dir.path().to_path_buf(), None, "startup".to_string(), 0).unwrap();
+    let mmap_path = manager.mmap_path();
+
+    {
+        let mut buffer =
+            PersistentBuffer::open_with_capacity(&mmap_path, DEFAULT_BUFFER_BLOCK_LEN).unwrap();
+        assert!(buffer.append_block(&make_block(1, "RECOVERED")).unwrap());
+    }
+
+    let buffer =
+        PersistentBuffer::open_with_capacity(&mmap_path, DEFAULT_BUFFER_BLOCK_LEN).unwrap();
+    let engine = AppenderEngine::new(manager, buffer, EngineMode::Async, 0, 10 * 24 * 60 * 60);
+    engine.flush(true).unwrap();
+
+    let mut paths: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("xlog"))
+        .collect();
+    paths.sort();
+    assert_eq!(paths.len(), 1);
+    let payloads = parse_payloads(&fs::read(&paths[0]).unwrap());
+    assert_eq!(payloads, vec!["RECOVERED".to_string()]);
+}
+
+#[test]
 fn concurrent_async_writes_keep_all_messages() {
     let dir = tempfile::tempdir().unwrap();
     let manager =
