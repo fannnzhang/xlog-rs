@@ -2,8 +2,28 @@ use chrono::{DateTime, Datelike, Local, Timelike};
 
 use crate::record::LogRecord;
 
+/// Keep parity with Mars formatter's body cap behavior.
+const MAX_LOG_BODY_BYTES: usize = 0xFFFF;
+
 pub fn extract_file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+fn truncate_utf8_to_max_bytes(input: &str, max_bytes: usize) -> &str {
+    if input.len() <= max_bytes {
+        return input;
+    }
+
+    let mut end = 0usize;
+    for (idx, ch) in input.char_indices() {
+        let next = idx + ch.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+
+    &input[..end]
 }
 
 fn format_time(ts: std::time::SystemTime) -> String {
@@ -25,6 +45,7 @@ fn format_time(ts: std::time::SystemTime) -> String {
 /// Reproduce C++ `formater.cc` output layout as one text line.
 pub fn format_record(record: &LogRecord, body: &str) -> String {
     let filename = extract_file_name(&record.filename);
+    let body = truncate_utf8_to_max_bytes(body, MAX_LOG_BODY_BYTES);
     let tid_suffix = if record.tid == record.maintid {
         "*"
     } else {
@@ -82,5 +103,20 @@ mod tests {
         assert!(line.contains("[core]"));
         assert!(line.contains("[c.rs:42, module::f]"));
         assert!(line.ends_with("msg\n"));
+    }
+
+    #[test]
+    fn format_truncates_oversized_body_on_utf8_boundary() {
+        let record = LogRecord::default();
+        let body = "好".repeat(40_000); // 120_000 bytes, exceeds cap
+
+        let line = format_record(&record, &body);
+        assert!(line.ends_with('\n'));
+
+        let payload = line.strip_suffix('\n').unwrap();
+        let open = payload.rfind('[').unwrap();
+        let body_out = &payload[open + 1..];
+        assert!(body_out.len() <= super::MAX_LOG_BODY_BYTES);
+        assert!(std::str::from_utf8(body_out.as_bytes()).is_ok());
     }
 }

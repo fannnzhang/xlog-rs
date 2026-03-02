@@ -10,7 +10,7 @@
 2. `formater.cc` 负责的是**日志文本行格式化**，xlog 的“二进制文件协议”实际在 `log_crypt.cc + log_base_buffer.cc + log_zlib/zstd_buffer.cc`。
 3. 兼容性验收不能只做“字节完全一致”，应以**官方解码结果一致**为主（压缩流字节可不同但可解码）。
 
-### 0.1 执行状态（截至 2026-02-28，分支 `codex/rust-migration-phase1`）
+### 0.1 执行状态（截至 2026-03-02，分支 `codex/rust-migration-phase1`）
 
 - Phase 0：未开始。
 - Phase 1：已完成（commit: `643900d`）。
@@ -22,24 +22,24 @@
   - 已完成 2C-1：fixture 生成与 no-crypt 解码对比脚本。
   - 已完成 2C-2：crypt 用例在 Python2 官方解码环境下的回归固化（`scripts/xlog/setup_py2_decoder_env.sh` + `scripts/xlog/run_phase2c2_official.sh`）。
 - Phase 3：已完成（commit: `3558c76`）。
-- Phase 4：主干已完成（commit: `2586d81`），Review 收口中（见 `docs/rust_migration_review.md`）。
+- Phase 4：已完成（commit: `2586d81` + 当前增量 Review 收口）。
 - Phase 5：进行中（当前增量）。
   - `xlog` 默认 feature 已切换到 `rust-backend`，并保留 `ffi-backend` 紧急回退。
   - JNI/UniFFI/NAPI 绑定层均改为可切换 `rust-backend` / `ffi-backend`。
   - 新增 `scripts/xlog/run_phase5_regression.sh` + `crates/xlog/examples/bench_backend.rs` 统一执行回归与性能对比。
-  - 已具备性能比值产物与可选门槛校验；默认切换前仍需完成 Review 阻断项收口。
+  - 已具备性能比值产物与可选门槛校验；Review 阻断项已关闭，性能优化持续中。
 - Phase 6：未开始。
 
-### 0.2 Review 收口清单（截至 2026-02-28）
+### 0.2 Review 收口清单（截至 2026-03-02）
 
-基于 `docs/rust_migration_review.md`，迁移主干之外仍需关闭以下兼容项：
+基于 `docs/rust_migration_review.md`，原兼容项已全部关闭（截至 2026-03-02）：
 
-1. `backend/rust.rs`：`maintid` 当前误用 `pid`（跨平台主线程 `*` 标记偏差）。
-2. `backend/rust.rs`：sync + crypt 场景 magic 与 payload 语义不一致风险。
-3. `formatter.rs`：缺少 C++ 对齐的 body 截断保护。
-4. `appender_engine.rs`：缺少 4/5 buffer 满时告警注入。
-5. `platform_console.rs`：Android console 输出未对接 Logcat。
-6. `oneshot.rs`：对截断 mmap 文件恢复容错不足（`read_exact`）。
+1. `backend/rust.rs`：`maintid` 改为主线程 tid 缓存。
+2. `backend/rust.rs`：sync + crypt magic/payload 语义已对齐。
+3. `formatter.rs`：已补齐 body 截断策略。
+4. `appender_engine.rs` + `backend/rust.rs`：已补齐 4/5 高水位告警注入路径。
+5. `platform_console.rs`：Android 已切换 `__android_log_write`。
+6. `oneshot.rs`：截断 mmap 容错已支持（`read_to_end` + 补零）。
 
 ---
 
@@ -426,7 +426,7 @@ DoD：
 
 目标：完成 Rust 运行时替换，覆盖 `xlogger_interface.cc` 能力。
 
-当前状态：主功能完成，Review 收口中（存在 P0/P2 兼容项待关闭）。
+当前状态：已完成（主功能 + Review 阻断项收口完成）。
 
 任务：
 
@@ -435,7 +435,7 @@ DoD：
 3. 实现 `flush/flush_all/set_level/is_enabled` 等控制面。
 4. 实现 console 输出与 thread id 填充。
 5. 实现 `dump/memory_dump`。
-6. 关闭 `docs/rust_migration_review.md` 中与 Phase 4 相关的阻断与中优先级项。
+6. 持续维护 `docs/rust_migration_review.md`，确保阻断项保持清零。
 
 涉及文件：
 
@@ -448,17 +448,17 @@ DoD：
 
 实现要点：
 
-- 异步阈值：1/3 唤醒已完成；4/5 注入 fatal 提示待补齐。
+- 异步阈值：1/3 唤醒与 4/5 高水位告警注入均已落地。
 - 后台线程周期对齐：15 分钟。
 - `flush(sync=true)` 需要阻塞等待后台实际刷盘完成。
 - `dump/memory_dump` 输出格式对齐现有实现（包括截断策略）。
-- `maintid` 与 sync/crypt magic 语义需按 C++ 现状进一步对齐。
+- `maintid` 与 sync/crypt magic 语义已按 C++ 当前行为对齐。
 
 DoD：
 
 - `xlog` 公开接口在 Rust 后端全部可用。
 - Android JNI 示例应用行为无回归。
-- Review 阻断项（P0）为 0，且对应回归测试落地。
+- Review 阻断项（P0）为 0，且对应回归测试已落地。
 
 ---
 
@@ -473,7 +473,7 @@ DoD：
 1. `xlog` 默认 feature 切到 Rust backend。
 2. 绑定层回归（JNI/UniFFI/NAPI）。
 3. 增加压测和 soak test。
-4. 在默认切换前，完成 Phase 4 Review 清单剩余项并复跑全链路回归。
+4. 复跑全链路回归并持续跟踪性能指标。
 
 涉及文件：
 

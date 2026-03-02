@@ -42,16 +42,28 @@ struct RustBackend {
     config: XlogConfig,
     level: AtomicI32,
     console_open: AtomicBool,
+    async_high_watermark_warned: AtomicBool,
     seq: SeqGenerator,
     cipher: EcdhTeaCipher,
     engine: AppenderEngine,
 }
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
+static MAIN_TID: OnceLock<i64> = OnceLock::new();
+
+const ASYNC_WARNING_THRESHOLD_NUM: usize = 4;
+const ASYNC_WARNING_THRESHOLD_DEN: usize = 5;
+const ASYNC_WARNING_TAG: &str = "mars::xlog";
+const ASYNC_WARNING_FILE: &str = "appender.cc";
+const ASYNC_WARNING_FUNC: &str = "__WriteAsync";
 
 fn registry() -> &'static InstanceRegistry<RustBackend> {
     static REGISTRY: OnceLock<InstanceRegistry<RustBackend>> = OnceLock::new();
     REGISTRY.get_or_init(InstanceRegistry::new)
+}
+
+fn main_tid() -> i64 {
+    *MAIN_TID.get_or_init(current_tid)
 }
 
 impl RustBackend {
@@ -91,6 +103,7 @@ impl RustBackend {
         Ok(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             console_open: AtomicBool::new(false),
+            async_high_watermark_warned: AtomicBool::new(false),
             level: AtomicI32::new(level_to_i32(level)),
             config,
             seq: SeqGenerator::default(),
@@ -114,6 +127,8 @@ impl RustBackend {
         let now = Local::now();
         let pid = std::process::id() as i64;
         let tid = current_tid();
+        let maintid = main_tid();
+        let is_crypt = self.cipher.enabled() && mode == AppenderMode::Async;
 
         let record = LogRecord {
             level: to_core_level(level),
@@ -124,7 +139,7 @@ impl RustBackend {
             timestamp: std::time::SystemTime::now(),
             pid,
             tid,
-            maintid: pid,
+            maintid,
         };
         let line = mars_xlog_core::formatter::format_record(&record, msg);
 
@@ -148,7 +163,7 @@ impl RustBackend {
             },
         };
 
-        if self.cipher.enabled() {
+        if is_crypt {
             payload = match mode {
                 AppenderMode::Sync => self.cipher.encrypt_sync(&payload),
                 AppenderMode::Async => self.cipher.encrypt_async(&payload),
@@ -165,7 +180,7 @@ impl RustBackend {
         };
 
         let header = LogHeader {
-            magic: select_magic(compression_kind, append_mode, self.cipher.enabled()),
+            magic: select_magic(compression_kind, append_mode, is_crypt),
             seq: match mode {
                 AppenderMode::Sync => SeqGenerator::sync_seq(),
                 AppenderMode::Async => self.seq.next_async(),
@@ -173,7 +188,11 @@ impl RustBackend {
             begin_hour: chrono::Timelike::hour(&now) as u8,
             end_hour: chrono::Timelike::hour(&now) as u8,
             len: payload.len() as u32,
-            client_pubkey: self.cipher.client_pubkey(),
+            client_pubkey: if is_crypt {
+                self.cipher.client_pubkey()
+            } else {
+                [0; 64]
+            },
         };
 
         let mut block = Vec::with_capacity(73 + payload.len() + 1);
@@ -181,6 +200,47 @@ impl RustBackend {
         block.extend_from_slice(&payload);
         block.push(MAGIC_END);
         block
+    }
+
+    fn maybe_emit_async_high_watermark_warning(&self) {
+        let Some((len, capacity)) = self.engine.async_buffer_stats() else {
+            self.async_high_watermark_warned
+                .store(false, Ordering::Relaxed);
+            return;
+        };
+        if capacity == 0 {
+            self.async_high_watermark_warned
+                .store(false, Ordering::Relaxed);
+            return;
+        }
+
+        let threshold =
+            capacity.saturating_mul(ASYNC_WARNING_THRESHOLD_NUM) / ASYNC_WARNING_THRESHOLD_DEN;
+        if len < threshold {
+            self.async_high_watermark_warned
+                .store(false, Ordering::Relaxed);
+            return;
+        }
+
+        if self
+            .async_high_watermark_warned
+            .swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+
+        let warning = format!(
+            "sg_buffer_async.Length() >= BUFFER_BLOCK_LENTH*4/5, len:{len}, capacity:{capacity}"
+        );
+        let block = self.build_block(
+            LogLevel::Fatal,
+            ASYNC_WARNING_TAG,
+            ASYNC_WARNING_FILE,
+            ASYNC_WARNING_FUNC,
+            0,
+            &warning,
+        );
+        let _ = self.engine.write_block(&block, true);
     }
 
     fn make_logfile_name_impl(&self, timespan: i32, prefix: &str) -> Vec<String> {
@@ -333,6 +393,10 @@ impl XlogBackend for RustBackend {
 
     fn set_appender_mode(&self, mode: AppenderMode) {
         let _ = self.engine.set_mode(appender_to_engine_mode(mode));
+        if mode == AppenderMode::Sync {
+            self.async_high_watermark_warned
+                .store(false, Ordering::Relaxed);
+        }
     }
 
     fn flush(&self, sync: bool) {
@@ -370,6 +434,7 @@ impl XlogBackend for RustBackend {
 
         let block = self.build_block(level, tag, file, func, line, msg);
         let _ = self.engine.write_block(&block, level == LogLevel::Fatal);
+        self.maybe_emit_async_high_watermark_warning();
     }
 }
 
@@ -439,9 +504,27 @@ fn to_console_level(level: LogLevel) -> ConsoleLevel {
 mod tests {
     use std::fs;
 
+    use mars_xlog_core::protocol::{
+        LogHeader, HEADER_LEN, MAGIC_SYNC_NO_CRYPT_ZLIB_START, TAILER_LEN,
+    };
+
     use super::RustBackend;
     use crate::backend::XlogBackend;
-    use crate::LogLevel;
+    use crate::{AppenderMode, LogLevel, XlogConfig};
+
+    const TEST_SERVER_PUBKEY_HEX: &str = concat!(
+        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8"
+    );
+
+    fn parse_block_payload(block: &[u8]) -> (LogHeader, &[u8]) {
+        let header = LogHeader::decode(&block[..HEADER_LEN]).unwrap();
+        let payload_len = header.len as usize;
+        let payload_start = HEADER_LEN;
+        let payload_end = HEADER_LEN + payload_len;
+        assert_eq!(block.len(), payload_end + TAILER_LEN);
+        (header, &block[payload_start..payload_end])
+    }
 
     #[test]
     fn rust_backend_writes_xlog_block() {
@@ -466,6 +549,52 @@ mod tests {
         }
 
         assert!(found, "expected at least one xlog output file");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_mode_with_pubkey_uses_no_crypt_magic_and_plain_payload() {
+        let root = std::env::temp_dir().join(format!(
+            "xlog-rust-backend-sync-crypt-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let cfg = XlogConfig::new(root.to_string_lossy().to_string(), "demo-sync")
+            .mode(AppenderMode::Sync)
+            .pub_key(TEST_SERVER_PUBKEY_HEX);
+        let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
+
+        let block = backend.build_block(LogLevel::Info, "tag", "main.rs", "f", 7, "plain-sync");
+        let (header, payload) = parse_block_payload(&block);
+        assert_eq!(header.magic, MAGIC_SYNC_NO_CRYPT_ZLIB_START);
+        assert_eq!(header.client_pubkey, [0; 64]);
+
+        let line = std::str::from_utf8(payload).unwrap();
+        assert!(line.contains("plain-sync"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn formatted_line_marks_main_thread_when_tid_matches() {
+        let root =
+            std::env::temp_dir().join(format!("xlog-rust-backend-maintid-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let cfg = XlogConfig::new(root.to_string_lossy().to_string(), "demo-maintid")
+            .mode(AppenderMode::Sync);
+        let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
+        let block = backend.build_block(LogLevel::Info, "tag", "main.rs", "f", 9, "maintid");
+        let (_header, payload) = parse_block_payload(&block);
+        let line = std::str::from_utf8(payload).unwrap();
+
+        if super::current_tid() == super::main_tid() {
+            assert!(line.contains('*'));
+        } else {
+            assert!(!line.contains('*'));
+        }
         let _ = fs::remove_dir_all(&root);
     }
 }

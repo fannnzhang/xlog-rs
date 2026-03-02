@@ -31,9 +31,14 @@ pub fn oneshot_flush(
         Err(_) => return FileIoAction::OpenFailed,
     };
 
-    let mut data = vec![0u8; mmap_capacity];
-    if f.read_exact(&mut data).is_err() {
+    let mut data = Vec::with_capacity(mmap_capacity);
+    if f.read_to_end(&mut data).is_err() {
         return FileIoAction::ReadFailed;
+    }
+    if data.len() < mmap_capacity {
+        data.resize(mmap_capacity, 0);
+    } else if data.len() > mmap_capacity {
+        data.truncate(mmap_capacity);
     }
 
     let recovered = recover_blocks(&data);

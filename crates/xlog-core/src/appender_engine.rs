@@ -187,6 +187,16 @@ impl AppenderEngine {
         Ok(())
     }
 
+    pub fn async_buffer_stats(&self) -> Option<(usize, usize)> {
+        if self.mode() != EngineMode::Async {
+            return None;
+        }
+        self.state
+            .lock()
+            .ok()
+            .map(|s| (s.buffer.len(), s.buffer.capacity()))
+    }
+
     pub fn flush(&self, sync: bool) -> Result<(), AppenderEngineError> {
         if self.mode() == EngineMode::Sync {
             let mut state = self.state.lock().expect("state lock poisoned");

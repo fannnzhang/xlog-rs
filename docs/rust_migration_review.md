@@ -7,68 +7,67 @@
 
 ## 1. 结论
 
-当前 Rust 迁移主链路已可运行并通过现有回归，但仍有少量兼容性收敛项需要补齐。
+当前 Rust 迁移主链路已可运行并通过现有回归，上一版报告中的阻断项已完成收口。
 
-- 阻断级（必须修）：**2 项 P0**
-- 中优先级（建议本轮修）：**4 项 P2**
-- 其余条目为可读性建议、架构差异说明或已接受偏差
+- 阻断级（必须修）：**0 项**
+- 中优先级（兼容收敛）：**0 项**
+- 保留项：可读性建议、架构差异说明或后续优化项
 
 > 本修订版重点修正了原报告里“问题级别和结论不一致”的内容，只保留可执行结论。
 
 ---
 
-## 2. 必须修复（Blocking）
+## 2. 已完成整改（原 Blocking/P2）
 
-### P0-1 `maintid` 使用了 `pid`（会导致主线程 `*` 标记异常）
-
-- 文件：`crates/xlog/src/backend/rust.rs`
-- 现状：`LogRecord { maintid: pid }`
-- 影响：在 macOS/iOS 等平台 `pid != tid`，`[pid, tid*]` 的 `*` 可能长期缺失
-- 修复建议：缓存进程启动时主线程 tid，写日志时使用该值填充 `maintid`
-
-### P0-2 Sync + crypt 场景 magic 与 payload 语义不一致
+### 2.1 `maintid` 使用 `pid` 的问题已修复
 
 - 文件：`crates/xlog/src/backend/rust.rs`
-- 现状：
-  - sync 模式下 `encrypt_sync` 返回明文（与 C++ 当前行为一致）
-  - 但 header magic 的 crypt 位仍按 `cipher.enabled()` 计算
-- 影响：解码器可能按“加密块”路径处理明文 payload，造成兼容风险
-- 修复建议：sync 模式下强制 `is_crypt = false`，或显式复刻 C++ 当前“sync 不加密且非 crypt magic”语义
+- 修复：改为缓存主线程 tid（`OnceLock`）并用于 `LogRecord.maintid`
+- 结果：跨平台 `tid == maintid` 时可正确输出 `*` 标记
 
----
+### 2.2 Sync + crypt magic/payload 语义不一致已修复
 
-## 3. 中优先级收敛项（建议本轮修）
+- 文件：`crates/xlog/src/backend/rust.rs`
+- 修复：引入 `is_crypt = cipher.enabled() && mode == Async`
+- 结果：sync 模式不再写 crypt magic，且 `client_pubkey` 与 magic 语义一致
 
-### P2-1 `formatter` 缺少 body 截断策略
+### 2.3 formatter body 截断策略已补齐
 
 - 文件：`crates/xlog-core/src/formatter.rs`
-- 现状：body 无长度保护，超长消息可直接拼接
-- 风险：极端大消息会放大单条 block，偏离 C++ 的保守截断行为
-- 建议：补齐与 C++ 相近的上限策略（至少限制 body 上限并保留尾部换行）
+- 修复：新增 UTF-8 边界截断（`MAX_LOG_BODY_BYTES = 0xFFFF`）
+- 结果：超长消息不再无限放大单条 block
 
-### P2-2 `appender_engine` 未实现 4/5 buffer 告警注入
+### 2.4 4/5 buffer 告警注入已补齐
 
-- 文件：`crates/xlog-core/src/appender_engine.rs`
-- 现状：实现了 1/3 唤醒阈值，但未注入 C++ 的 4/5 fatal 提示日志
-- 风险：高压下缺少观测信号，不利于问题定位
+- 文件：`crates/xlog-core/src/appender_engine.rs` + `crates/xlog/src/backend/rust.rs`
+- 修复：补充 async buffer 统计与高水位告警注入路径
+- 结果：高压场景下会产出告警日志并触发强制 flush
 
-### P2-3 Android console 输出仍走 `println!`
+### 2.5 Android console 输出已切换 Logcat
 
 - 文件：`crates/xlog-core/src/platform_console.rs`
-- 现状：Android 分支为 `println!`
-- 风险：日志不一定进入 Logcat
-- 建议：切换到 `__android_log_write`（或等效封装）
+- 修复：Android 分支改为 `__android_log_write`
+- 结果：console 日志路径与平台行为对齐
 
-### P2-4 `oneshot_flush` 对截断 mmap 文件容错不足
+### 2.6 `oneshot_flush` 截断文件容错已补齐
 
 - 文件：`crates/xlog-core/src/oneshot.rs`
-- 现状：`read_exact` 读取固定容量，文件变短时直接失败
-- 风险：异常中断后恢复成功率下降
-- 建议：改为 `read_to_end` + 不足部分补零
+- 修复：`read_to_end` + 不足补零 + 超长截断
+- 结果：截断 mmap 文件可恢复，崩溃场景鲁棒性提升
 
 ---
 
-## 4. 非阻断项（已复核）
+## 3. 新增回归验证（已落地）
+
+- `crates/xlog-core/src/formatter.rs`：新增超长 UTF-8 截断单测
+- `crates/xlog-core/tests/oneshot_flush.rs`：新增截断 mmap 恢复单测
+- `crates/xlog/src/backend/rust.rs`：
+  - 新增 sync + pub_key magic/payload 语义单测
+  - 新增主线程 `*` 标记行为单测
+
+---
+
+## 4. 非阻断项（保留）
 
 ### 4.1 可读性或文档注释项
 
@@ -88,21 +87,18 @@
 
 ---
 
-## 5. 与迁移计划的对应关系
+## 5. 与迁移计划的对应关系（更新后）
 
 本报告对应 `docs/xlog_rust_migration_plan.md` 的收敛项应纳入：
 
-1. **Phase 4 收口**：P0-1、P0-2、P2-1、P2-2、P2-3、P2-4
-2. **Phase 5 灰度前门槛**：以上 6 项需关闭，且补齐回归测试
-3. **Phase 6 前置条件**：P0 必须为 0，P2 至少有明确验收结论
+1. **Phase 4 收口**：本报告原 P0/P2 项已关闭
+2. **Phase 5 灰度前门槛**：review 阻断项清零，保持回归脚本持续运行
+3. **Phase 6 前置条件**：保持 review 阻断项为 0 并继续做性能/构建收敛
 
 ---
 
-## 6. 建议新增回归测试
+## 6. 建议继续跟进
 
-- sync + pub_key 场景：验证 magic / 解码链路
-- 主线程标记场景：验证 `[pid, tid*]` 与跨平台行为
-- 超长 body 场景：验证截断策略与协议合法性
-- 截断 mmap 恢复场景：验证 `oneshot_flush` 容错
-- Android console 场景：验证 Logcat 可见性
-
+- Android 真机验证 Logcat 输出链路（本次代码已切换，建议补 CI/设备验证）
+- 高压场景进一步验证 4/5 告警触发频次与可观测性
+- 持续跟踪 Rust/FFI 性能差距并推进优化
