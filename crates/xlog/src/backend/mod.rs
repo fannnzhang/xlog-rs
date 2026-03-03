@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::{AppenderMode, FileIoAction, LogLevel, XlogConfig, XlogError};
+use crate::{AppenderMode, FileIoAction, LogLevel, RawLogMeta, XlogConfig, XlogError};
 
 #[cfg(any(
     target_os = "ios",
@@ -34,6 +34,7 @@ pub(crate) trait XlogBackend: Send + Sync {
         func: &str,
         line: u32,
         msg: &str,
+        raw_meta: RawLogMeta,
     );
 }
 
@@ -49,6 +50,17 @@ pub(crate) trait XlogBackendProvider: Send + Sync {
     fn appender_open(&self, config: &XlogConfig, level: LogLevel) -> Result<(), XlogError>;
     fn appender_close(&self);
     fn flush_all(&self, sync: bool);
+    fn global_is_enabled(&self, level: LogLevel) -> bool;
+    fn write_global_with_meta(
+        &self,
+        level: LogLevel,
+        tag: &str,
+        file: &str,
+        func: &str,
+        line: u32,
+        msg: &str,
+        raw_meta: RawLogMeta,
+    );
 
     #[cfg(any(
         target_os = "ios",

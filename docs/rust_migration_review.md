@@ -17,17 +17,18 @@
    - **C++ 对比**：C++ 版本在 `appender.cc:__WriteAsync` 和 `__AsyncLogThread` 中硬共用同一把 `mutex_buffer_async_` 大锁，因此压缩、追加、与后台刷盘在物理上完全互斥，无此竞争。
    - **解决方式**：不破坏 Rust 优良的无阻塞分治锁架构，通过在 `AppenderEngine::write_async_pending_check_epoch` 内部注入原子 Epoch 检验。前端在覆盖 Mmap 时若发现 Epoch 突变（已被刷盘），则直接摒弃已残缺的内存压缩块，重发原始文本进行安全重试（Loop Retry），彻底根除丢日志隐患。
 
-## 3. 剩余细微未对齐项（待实现）
+## 3. 本轮收口结果（已完成）
 
-经过排查，当前仍有 2 项在 Wrapper 层级与 C++ 的 API 行为存在不匹配，主要涉及 JNI / FFI 层的 Raw 接口调用。
+针对上一版中遗留的 2 项 Wrapper 级差异，已在当前分支完成收口：
 
-1. **`XLoggerInfo.traceLog` 旁路特性丢失**
-   - **差异**：在 C++ `appender.cc` 中，对于 Android 平台，如果传入的 `XLoggerInfo::traceLog == 1`，即使 `consolelog_open_ == false` 也会强行输出到 Logcat。
-   - **Rust 现状**：`mars-xlog-core::record::LogRecord` 尚未具有 `trace_log` 字段，且 `xlog` API 不支持旁路 Console 的独立判断。
-2. **`XloggerWrite(instance_ptr==0)` 的全局 Raw Metadata 写路径**
-   - **差异**：C++ 允许 JNI/FFI 层构建附带自定义 `pid` / `tid` / `maintid` 的 `XLoggerInfo` 并直接投递给 Global Appender。
-   - **Rust 现状**：Rust 封装的 `write_with_meta` 会在本地以 `std::process::id()` 强制复写被传入的元数据，导致 Android 绑定层拿到的 Java Thread ID 被抹去。
+1. **`traceLog` Android 旁路语义已补齐**
+   - 在 `xlog` 新增 `RawLogMeta { trace_log }` 传递通道。
+   - Rust backend 在 Android 上改为：`console_open == true` 或 `trace_log == true` 任一满足即写 Console，语义对齐 C++ `appender.cc`。
+2. **全局 Raw Metadata 写路径与 PID/TID 复写策略已对齐**
+   - 新增 `Xlog::appender_write_with_meta_raw(...)`，对应 `XloggerWrite(instance_ptr == 0, ...)` 能力。
+   - `pid/tid/maintid` 填充规则按 C++ 双路径对齐：
+     - `instance_ptr != 0`（Category 路径）：仅在三者全为 `-1` 时批量回填。
+     - `instance_ptr == 0`（Global 路径）：逐字段按 `-1` 回填。
+   - 由此避免 Java/JNI 侧传入线程元数据被 Rust 层强制覆写的问题。
 
----
-
-由于上述 2 项系本轮比对的最后差异，我们已制定实施计划准备对其修复。
+上述两项修复后，本轮 review 中定义的 Rust 重构语义差异已全部收口。

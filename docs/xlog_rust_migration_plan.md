@@ -31,7 +31,7 @@
   - 已具备性能比值产物与可选门槛校验；兼容性剩余项主要集中在接口覆盖。
 - Phase 6：未开始。
 
-### 0.2 Review 收口清单（截至 2026-03-02）
+### 0.2 Review 收口清单（截至 2026-03-03）
 
 基于 `docs/rust_migration_review.md`，本轮已收敛的关键项：
 
@@ -53,11 +53,11 @@
 16. `file_manager.rs`：`filepaths_from_timespan` 恢复 log_dir -> cache_dir 顺序，不做额外排序。
 17. `appender_engine.rs` + `oneshot.rs`：补齐 mmap 恢复 begin/end tip 行（含 mark info）。
 18. `platform_console.rs`：Apple console 改为原生 OSLog/NSLog/printf shim 输出。
+19. `backend/{mod.rs,rust.rs,ffi.rs}` + `xlog/lib.rs`：补齐 `RawLogMeta` 与 `appender_write_with_meta_raw`，对齐 `traceLog` 旁路语义及 `instance_ptr==0` 全局 raw metadata 写入路径。
 
 仍待收口（详见 `docs/rust_migration_review.md`）：
 
-1. `traceLog` 与 `XloggerWrite(instance_ptr==0)` 等 raw info 入口尚未完整暴露。
-2. UniFFI/NAPI 绑定覆盖仍小于 C++ 接口面。
+1. UniFFI/NAPI 绑定覆盖仍小于 C++ 接口面。
 
 ---
 

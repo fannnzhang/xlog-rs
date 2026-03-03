@@ -27,7 +27,9 @@ use mars_xlog_core::record::{LogLevel as CoreLogLevel, LogRecord};
 use mars_xlog_core::registry::InstanceRegistry;
 
 use super::{XlogBackend, XlogBackendProvider};
-use crate::{AppenderMode, CompressMode, FileIoAction, LogLevel, XlogConfig, XlogError};
+use crate::{
+    AppenderMode, CompressMode, FileIoAction, LogLevel, RawLogMeta, XlogConfig, XlogError,
+};
 
 #[cfg(any(
     target_os = "ios",
@@ -52,6 +54,12 @@ struct RustBackend {
     cipher: EcdhTeaCipher,
     engine: AppenderEngine,
     async_state: Mutex<Option<AsyncPendingState>>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum MetaResolveMode {
+    Category,
+    Global,
 }
 
 enum AsyncCompressor {
@@ -217,14 +225,14 @@ impl RustBackend {
         func: &str,
         line: u32,
         msg: &str,
+        pid: i64,
+        tid: i64,
+        maintid: i64,
     ) -> Option<Vec<u8>> {
         let mode = engine_to_appender_mode(self.engine.mode());
         let compress = self.config.compress_mode;
 
         let now = Local::now();
-        let pid = std::process::id() as i64;
-        let tid = current_tid();
-        let maintid = main_tid();
         let is_crypt = self.cipher.enabled();
 
         let record = LogRecord {
@@ -307,6 +315,9 @@ impl RustBackend {
         func: &str,
         line: u32,
         msg: &str,
+        pid: i64,
+        tid: i64,
+        maintid: i64,
     ) -> String {
         let record = LogRecord {
             level: to_core_level(level),
@@ -315,11 +326,85 @@ impl RustBackend {
             func_name: func.to_string(),
             line: line as i32,
             timestamp: std::time::SystemTime::now(),
-            pid: std::process::id() as i64,
-            tid: current_tid(),
-            maintid: main_tid(),
+            pid,
+            tid,
+            maintid,
         };
         mars_xlog_core::formatter::format_record(&record, msg)
+    }
+
+    fn resolve_record_meta(&self, raw_meta: RawLogMeta, mode: MetaResolveMode) -> (i64, i64, i64) {
+        let runtime_pid = std::process::id() as i64;
+        let runtime_tid = current_tid();
+        let runtime_maintid = main_tid();
+        match mode {
+            // Category path (`XloggerWrite(instance_ptr != 0)`): C++ fills only
+            // when all 3 fields are -1, otherwise keeps user-provided values.
+            MetaResolveMode::Category => {
+                if raw_meta.pid == -1 && raw_meta.tid == -1 && raw_meta.maintid == -1 {
+                    (runtime_pid, runtime_tid, runtime_maintid)
+                } else {
+                    (raw_meta.pid, raw_meta.tid, raw_meta.maintid)
+                }
+            }
+            // Global path (`XloggerWrite(instance_ptr == 0)`): C++ fills each
+            // field independently when that field equals -1.
+            MetaResolveMode::Global => (
+                if raw_meta.pid == -1 {
+                    runtime_pid
+                } else {
+                    raw_meta.pid
+                },
+                if raw_meta.tid == -1 {
+                    runtime_tid
+                } else {
+                    raw_meta.tid
+                },
+                if raw_meta.maintid == -1 {
+                    runtime_maintid
+                } else {
+                    raw_meta.maintid
+                },
+            ),
+        }
+    }
+
+    fn write_with_meta_internal(
+        &self,
+        level: LogLevel,
+        tag: &str,
+        file: &str,
+        func: &str,
+        line: u32,
+        msg: &str,
+        raw_meta: RawLogMeta,
+        resolve_mode: MetaResolveMode,
+    ) {
+        if !self.is_enabled(level) {
+            return;
+        }
+
+        #[cfg(target_os = "android")]
+        let trace_console_bypass = raw_meta.trace_log;
+        #[cfg(not(target_os = "android"))]
+        let trace_console_bypass = false;
+
+        if self.console_open.load(Ordering::Relaxed) || trace_console_bypass {
+            write_console_line(to_console_level(level), tag, file, func, line, msg);
+        }
+
+        let (pid, tid, maintid) = self.resolve_record_meta(raw_meta, resolve_mode);
+
+        if self.engine.mode() == EngineMode::Async {
+            self.write_async_line(level, tag, file, func, line, msg, pid, tid, maintid);
+            return;
+        }
+
+        let Some(block) = self.build_block(level, tag, file, func, line, msg, pid, tid, maintid)
+        else {
+            return;
+        };
+        let _ = self.engine.write_block(&block, level == LogLevel::Fatal);
     }
 
     fn new_async_pending_state(&self, hour: u8, flush_epoch: u64) -> Option<AsyncPendingState> {
@@ -361,8 +446,11 @@ impl RustBackend {
         func: &str,
         line: u32,
         msg: &str,
+        pid: i64,
+        tid: i64,
+        maintid: i64,
     ) {
-        let line = self.format_record_line(level, tag, file, func, line, msg);
+        let line = self.format_record_line(level, tag, file, func, line, msg, pid, tid, maintid);
         let now_hour = chrono::Timelike::hour(&Local::now()) as u8;
         let engine_epoch = self.engine.async_flush_epoch();
         let capacity = self
@@ -503,6 +591,38 @@ impl XlogBackendProvider for RustBackendProvider {
             }
             backend.flush(sync);
         });
+    }
+
+    fn global_is_enabled(&self, level: LogLevel) -> bool {
+        registry()
+            .default_instance()
+            .map(|b| b.is_enabled(level))
+            .unwrap_or(false)
+    }
+
+    fn write_global_with_meta(
+        &self,
+        level: LogLevel,
+        tag: &str,
+        file: &str,
+        func: &str,
+        line: u32,
+        msg: &str,
+        raw_meta: RawLogMeta,
+    ) {
+        let Some(default) = registry().default_instance() else {
+            return;
+        };
+        default.write_with_meta_internal(
+            level,
+            tag,
+            file,
+            func,
+            line,
+            msg,
+            raw_meta,
+            MetaResolveMode::Global,
+        );
     }
 
     #[cfg(any(
@@ -648,24 +768,18 @@ impl XlogBackend for RustBackend {
         func: &str,
         line: u32,
         msg: &str,
+        raw_meta: RawLogMeta,
     ) {
-        if !self.is_enabled(level) {
-            return;
-        }
-
-        if self.console_open.load(Ordering::Relaxed) {
-            write_console_line(to_console_level(level), tag, file, func, line, msg);
-        }
-
-        if self.engine.mode() == EngineMode::Async {
-            self.write_async_line(level, tag, file, func, line, msg);
-            return;
-        }
-
-        let Some(block) = self.build_block(level, tag, file, func, line, msg) else {
-            return;
-        };
-        let _ = self.engine.write_block(&block, level == LogLevel::Fatal);
+        self.write_with_meta_internal(
+            level,
+            tag,
+            file,
+            func,
+            line,
+            msg,
+            raw_meta,
+            MetaResolveMode::Category,
+        );
     }
 }
 
@@ -746,7 +860,7 @@ mod tests {
 
     use super::RustBackend;
     use crate::backend::XlogBackend;
-    use crate::{AppenderMode, LogLevel, XlogConfig};
+    use crate::{AppenderMode, LogLevel, RawLogMeta, XlogConfig};
 
     const TEST_SERVER_PUBKEY_HEX: &str = concat!(
         "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
@@ -860,7 +974,15 @@ mod tests {
         let cfg = crate::XlogConfig::new(root.to_string_lossy().to_string(), "demo");
         let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
 
-        backend.write_with_meta(LogLevel::Info, "demo", "main.rs", "f", 1, "hello");
+        backend.write_with_meta(
+            LogLevel::Info,
+            "demo",
+            "main.rs",
+            "f",
+            1,
+            "hello",
+            RawLogMeta::default(),
+        );
         backend.flush(true);
 
         let mut found = false;
@@ -892,7 +1014,17 @@ mod tests {
         let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
 
         let block = backend
-            .build_block(LogLevel::Info, "tag", "main.rs", "f", 7, "plain-sync")
+            .build_block(
+                LogLevel::Info,
+                "tag",
+                "main.rs",
+                "f",
+                7,
+                "plain-sync",
+                std::process::id() as i64,
+                super::current_tid(),
+                super::main_tid(),
+            )
             .unwrap();
         let (header, payload) = parse_block_payload(&block);
         assert_eq!(header.magic, MAGIC_SYNC_ZLIB_START);
@@ -914,7 +1046,17 @@ mod tests {
             .mode(AppenderMode::Sync);
         let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
         let block = backend
-            .build_block(LogLevel::Info, "tag", "main.rs", "f", 9, "maintid")
+            .build_block(
+                LogLevel::Info,
+                "tag",
+                "main.rs",
+                "f",
+                9,
+                "maintid",
+                std::process::id() as i64,
+                super::current_tid(),
+                super::main_tid(),
+            )
             .unwrap();
         let (_header, payload) = parse_block_payload(&block);
         let line = std::str::from_utf8(payload).unwrap();
@@ -924,6 +1066,58 @@ mod tests {
         } else {
             assert!(!line.contains('*'));
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn category_mode_only_fills_when_all_meta_are_minus_one() {
+        let root = std::env::temp_dir().join(format!(
+            "xlog-rust-backend-category-meta-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let cfg = XlogConfig::new(root.to_string_lossy().to_string(), "demo-category-meta")
+            .mode(AppenderMode::Sync);
+        let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
+
+        let (pid, tid, maintid) =
+            backend.resolve_record_meta(RawLogMeta::default(), super::MetaResolveMode::Category);
+        assert_eq!(pid, std::process::id() as i64);
+        assert_eq!(tid, super::current_tid());
+        assert_eq!(maintid, super::main_tid());
+
+        let (pid, tid, maintid) = backend.resolve_record_meta(
+            RawLogMeta::new(123, -1, -1),
+            super::MetaResolveMode::Category,
+        );
+        assert_eq!(pid, 123);
+        assert_eq!(tid, -1);
+        assert_eq!(maintid, -1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_mode_fills_each_missing_meta_field_independently() {
+        let root = std::env::temp_dir().join(format!(
+            "xlog-rust-backend-global-meta-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let cfg = XlogConfig::new(root.to_string_lossy().to_string(), "demo-global-meta")
+            .mode(AppenderMode::Sync);
+        let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
+
+        let (pid, tid, maintid) = backend
+            .resolve_record_meta(RawLogMeta::new(321, -1, -1), super::MetaResolveMode::Global);
+        assert_eq!(pid, 321);
+        assert_eq!(tid, super::current_tid());
+        assert_eq!(maintid, super::main_tid());
+
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -938,8 +1132,24 @@ mod tests {
 
         let cfg = XlogConfig::new(root.to_string_lossy().to_string(), "demo-async");
         let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
-        backend.write_with_meta(LogLevel::Info, "tag", "f1.rs", "f1", 1, "one");
-        backend.write_with_meta(LogLevel::Info, "tag", "f2.rs", "f2", 2, "two");
+        backend.write_with_meta(
+            LogLevel::Info,
+            "tag",
+            "f1.rs",
+            "f1",
+            1,
+            "one",
+            RawLogMeta::default(),
+        );
+        backend.write_with_meta(
+            LogLevel::Info,
+            "tag",
+            "f2.rs",
+            "f2",
+            2,
+            "two",
+            RawLogMeta::default(),
+        );
         backend.flush(true);
 
         let xlog = fs::read_dir(&root)
@@ -970,8 +1180,24 @@ mod tests {
         let cfg = XlogConfig::new(root.to_string_lossy().to_string(), "demo-async-zstd")
             .compress_mode(crate::CompressMode::Zstd);
         let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
-        backend.write_with_meta(LogLevel::Info, "tag", "f1.rs", "f1", 1, "alpha");
-        backend.write_with_meta(LogLevel::Info, "tag", "f2.rs", "f2", 2, "beta");
+        backend.write_with_meta(
+            LogLevel::Info,
+            "tag",
+            "f1.rs",
+            "f1",
+            1,
+            "alpha",
+            RawLogMeta::default(),
+        );
+        backend.write_with_meta(
+            LogLevel::Info,
+            "tag",
+            "f2.rs",
+            "f2",
+            2,
+            "beta",
+            RawLogMeta::default(),
+        );
         backend.flush(true);
 
         let xlog = fs::read_dir(&root)
@@ -1002,8 +1228,24 @@ mod tests {
         let cfg = XlogConfig::new(root.to_string_lossy().to_string(), "demo-async-crypt-zlib")
             .pub_key(TEST_SERVER_PUBKEY_HEX);
         let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
-        backend.write_with_meta(LogLevel::Info, "tag", "f1.rs", "f1", 1, "gamma");
-        backend.write_with_meta(LogLevel::Info, "tag", "f2.rs", "f2", 2, "delta");
+        backend.write_with_meta(
+            LogLevel::Info,
+            "tag",
+            "f1.rs",
+            "f1",
+            1,
+            "gamma",
+            RawLogMeta::default(),
+        );
+        backend.write_with_meta(
+            LogLevel::Info,
+            "tag",
+            "f2.rs",
+            "f2",
+            2,
+            "delta",
+            RawLogMeta::default(),
+        );
         backend.flush(true);
 
         let xlog = fs::read_dir(&root)
@@ -1036,8 +1278,24 @@ mod tests {
             .compress_mode(crate::CompressMode::Zstd)
             .pub_key(TEST_SERVER_PUBKEY_HEX);
         let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
-        backend.write_with_meta(LogLevel::Info, "tag", "f1.rs", "f1", 1, "theta");
-        backend.write_with_meta(LogLevel::Info, "tag", "f2.rs", "f2", 2, "lambda");
+        backend.write_with_meta(
+            LogLevel::Info,
+            "tag",
+            "f1.rs",
+            "f1",
+            1,
+            "theta",
+            RawLogMeta::default(),
+        );
+        backend.write_with_meta(
+            LogLevel::Info,
+            "tag",
+            "f2.rs",
+            "f2",
+            2,
+            "lambda",
+            RawLogMeta::default(),
+        );
         backend.flush(true);
 
         let xlog = fs::read_dir(&root)
@@ -1075,6 +1333,7 @@ mod tests {
             "before",
             10,
             "before-switch",
+            RawLogMeta::default(),
         );
         backend.set_appender_mode(AppenderMode::Sync);
         backend.write_with_meta(
@@ -1084,6 +1343,7 @@ mod tests {
             "after",
             11,
             "after-switch",
+            RawLogMeta::default(),
         );
         backend.flush(true);
 
@@ -1133,6 +1393,9 @@ mod tests {
             "f",
             10,
             "ORIGINAL-LINE-SHOULD-BE-DROPPED",
+            std::process::id() as i64,
+            super::current_tid(),
+            super::main_tid(),
         );
 
         let pending = {

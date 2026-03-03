@@ -6,7 +6,7 @@ use libc::{c_int, gettimeofday, timeval};
 use mars_xlog_sys as sys;
 
 use super::{XlogBackend, XlogBackendProvider};
-use crate::{AppenderMode, FileIoAction, LogLevel, XlogConfig, XlogError};
+use crate::{AppenderMode, FileIoAction, LogLevel, RawLogMeta, XlogConfig, XlogError};
 
 #[cfg(any(
     target_os = "ios",
@@ -95,6 +95,23 @@ impl XlogBackendProvider for FfiBackendProvider {
         unsafe {
             sys::mars_xlog_flush_all(if sync { 1 } else { 0 });
         }
+    }
+
+    fn global_is_enabled(&self, level: LogLevel) -> bool {
+        unsafe { sys::mars_xlog_is_enabled(0, level.as_sys() as c_int) != 0 }
+    }
+
+    fn write_global_with_meta(
+        &self,
+        level: LogLevel,
+        tag: &str,
+        file: &str,
+        func: &str,
+        line: u32,
+        msg: &str,
+        raw_meta: RawLogMeta,
+    ) {
+        write_raw(0, level, tag, file, func, line, msg, raw_meta);
     }
 
     #[cfg(any(
@@ -241,33 +258,47 @@ impl XlogBackend for FfiBackend {
         func: &str,
         line: u32,
         msg: &str,
+        raw_meta: RawLogMeta,
     ) {
-        let mut cstrings = Vec::new();
-        let tag_c = crate::to_cstring(tag, &mut cstrings);
-        let file_c = crate::to_cstring(file, &mut cstrings);
-        let func_c = crate::to_cstring(func, &mut cstrings);
-        let msg_c = crate::to_cstring(msg, &mut cstrings);
+        write_raw(self.instance, level, tag, file, func, line, msg, raw_meta);
+    }
+}
 
-        let mut tv: timeval = unsafe { std::mem::zeroed() };
-        unsafe {
-            gettimeofday(&mut tv, ptr::null_mut());
-        }
+fn write_raw(
+    instance: usize,
+    level: LogLevel,
+    tag: &str,
+    file: &str,
+    func: &str,
+    line: u32,
+    msg: &str,
+    raw_meta: RawLogMeta,
+) {
+    let mut cstrings = Vec::new();
+    let tag_c = crate::to_cstring(tag, &mut cstrings);
+    let file_c = crate::to_cstring(file, &mut cstrings);
+    let func_c = crate::to_cstring(func, &mut cstrings);
+    let msg_c = crate::to_cstring(msg, &mut cstrings);
 
-        let info = sys::XLoggerInfo {
-            level: level.as_sys(),
-            tag: tag_c,
-            filename: file_c,
-            func_name: func_c,
-            line: line as c_int,
-            timeval: tv,
-            pid: -1,
-            tid: -1,
-            maintid: -1,
-            traceLog: 0,
-        };
+    let mut tv: timeval = unsafe { std::mem::zeroed() };
+    unsafe {
+        gettimeofday(&mut tv, ptr::null_mut());
+    }
 
-        unsafe {
-            sys::mars_xlog_write(self.instance, &info, msg_c);
-        }
+    let info = sys::XLoggerInfo {
+        level: level.as_sys(),
+        tag: tag_c,
+        filename: file_c,
+        func_name: func_c,
+        line: line as c_int,
+        timeval: tv,
+        pid: raw_meta.pid as _,
+        tid: raw_meta.tid as _,
+        maintid: raw_meta.maintid as _,
+        traceLog: if raw_meta.trace_log { 1 } else { 0 },
+    };
+
+    unsafe {
+        sys::mars_xlog_write(instance, &info, msg_c);
     }
 }

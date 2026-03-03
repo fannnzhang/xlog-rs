@@ -117,6 +117,48 @@ impl From<c_int> for FileIoAction {
     }
 }
 
+/// Raw metadata carried by low-level wrappers (JNI/FFI parity path).
+///
+/// Semantics match Mars `XLoggerInfo`:
+/// - `pid/tid/maintid = -1` means "let backend fill runtime value".
+/// - `trace_log = true` enables Android console bypass behavior.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct RawLogMeta {
+    pub pid: i64,
+    pub tid: i64,
+    pub maintid: i64,
+    pub trace_log: bool,
+}
+
+impl Default for RawLogMeta {
+    fn default() -> Self {
+        Self {
+            pid: -1,
+            tid: -1,
+            maintid: -1,
+            trace_log: false,
+        }
+    }
+}
+
+impl RawLogMeta {
+    /// Build explicit pid/tid/maintid metadata.
+    pub const fn new(pid: i64, tid: i64, maintid: i64) -> Self {
+        Self {
+            pid,
+            tid,
+            maintid,
+            trace_log: false,
+        }
+    }
+
+    /// Enable Android `traceLog` console bypass for this entry.
+    pub const fn with_trace_log(mut self, trace_log: bool) -> Self {
+        self.trace_log = trace_log;
+        self
+    }
+}
+
 /// Errors returned by Xlog initialization helpers.
 #[derive(Debug, thiserror::Error)]
 pub enum XlogError {
@@ -374,6 +416,23 @@ impl Xlog {
         line: u32,
         msg: &str,
     ) {
+        self.write_with_meta_raw(level, tag, file, func, line, msg, RawLogMeta::default());
+    }
+
+    /// Log with explicit metadata and raw pid/tid/trace flags.
+    ///
+    /// This is mainly for low-level platform wrappers that already own thread
+    /// metadata (for example JNI side thread ids).
+    pub fn write_with_meta_raw(
+        &self,
+        level: LogLevel,
+        tag: Option<&str>,
+        file: &str,
+        func: &str,
+        line: u32,
+        msg: &str,
+        raw_meta: RawLogMeta,
+    ) {
         if !self.is_enabled(level) {
             return;
         }
@@ -384,6 +443,34 @@ impl Xlog {
             func,
             line,
             msg,
+            raw_meta,
+        );
+    }
+
+    /// Write via the global/default appender with raw metadata.
+    ///
+    /// This mirrors the C++ `XloggerWrite(instance_ptr == 0, ...)` path.
+    #[doc(hidden)]
+    pub fn appender_write_with_meta_raw(
+        level: LogLevel,
+        tag: Option<&str>,
+        file: &str,
+        func: &str,
+        line: u32,
+        msg: &str,
+        raw_meta: RawLogMeta,
+    ) {
+        if !backend::provider().global_is_enabled(level) {
+            return;
+        }
+        backend::provider().write_global_with_meta(
+            level,
+            tag.unwrap_or(""),
+            file,
+            func,
+            line,
+            msg,
+            raw_meta,
         );
     }
 
