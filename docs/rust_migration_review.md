@@ -1,135 +1,33 @@
-# Xlog Rust 迁移代码 Review 报告（2026-03-02 更新）
+# Rust Migration Review & Parity Deep Dive
 
-> 审查时间：2026-03-02  
-> 审查范围：`crates/xlog-core/src/*` + `crates/xlog/src/backend/rust.rs`  
-> 对照基线：`third_party/mars/mars/xlog/` C++ 实现
+## 1. 结论总结
 
-## 1. 结论
+经过对 Rust 版实现（`xlog-core` / `xlog` / bindings）与 C++ 版（`mars/xlog`）的源码深度对比，Rust 核心库在以下层面与 C++ 实现了高度的语义对齐：
+- **文件管理与滚动策略** (按天/大小切换、Cache 满溢移盘、并发写)。
+- **Appender 异步/同步模式** (Mmap 预写、缓冲池阈值唤醒、压缩流水线)。
+- **Crash-safe 恢复逻辑** (启动时 `recover_blocks`、torn-write 修补、Tip 标记)。
+- **加密签名字节级协议** (ECDH-TEA 流水线加密逻辑、协议头构造)。
 
-本轮已完成一批高风险行为对齐修复，Rust 侧在“恢复可靠性、文件一致性、控制台行为、sync+crypt 语义”上明显收敛。
+在最新一轮的深度对比中，我们进一步排查并修复了数个细微的边界差异：特别是发现在**后台 `flush` 与前端连续异步写入的交错场景**下，原生 Rust 使用的双锁架构（`RustBackend::async_state` 与 `AppenderEngine::state`）由于检查点时序问题，存在**极端条件下的数据丢失（Race Condition）**。
 
-当前状态：
+## 2. 本轮深层修复与功能对齐 (Deep Dive Fixes)
 
-- 已修复：**24 项**（含多项高风险）
-- 仍待收敛：**3 项**（以接口覆盖差异为主）
+1. **[CRITICAL] 后台 Flush 导致的异步 Pending Block 截断丢数据问题**
+   - **问题现象**：在异步高频写入时，如果恰好背景 Worker 线程达到 15 分钟超时或满 1/3 阈值触发 Flush，Worker 线程会抢占 Mmap 并刷盘。此时前端 `write_async_line` 如果恰好在检查 `async_flush_epoch` **之后**、写 Mmap **之前**，会导致前端状态机认为合并 Block 有效，最终用仅含后半段数据的 Block 覆盖了 Mmap（而此时 mmap 中旧的前半段数据已被 Worker 刷入磁盘）。结果：合并块的后半段数据丢失！
+   - **C++ 对比**：C++ 版本在 `appender.cc:__WriteAsync` 和 `__AsyncLogThread` 中硬共用同一把 `mutex_buffer_async_` 大锁，因此压缩、追加、与后台刷盘在物理上完全互斥，无此竞争。
+   - **解决方式**：不破坏 Rust 优良的无阻塞分治锁架构，通过在 `AppenderEngine::write_async_pending_check_epoch` 内部注入原子 Epoch 检验。前端在覆盖 Mmap 时若发现 Epoch 突变（已被刷盘），则直接摒弃已残缺的内存压缩块，重发原始文本进行安全重试（Loop Retry），彻底根除丢日志隐患。
 
----
+## 3. 剩余细微未对齐项（待实现）
 
-## 2. 本轮已修复项
+经过排查，当前仍有 2 项在 Wrapper 层级与 C++ 的 API 行为存在不匹配，主要涉及 JNI / FFI 层的 Raw 接口调用。
 
-### 2.1 mmap/文件一致性（高优先级）
-
-1. 启动时 mmap 恢复数据立即落盘（不再等待后续写入）。
-   - `crates/xlog-core/src/appender_engine.rs`
-2. torn-write 场景恢复逻辑放宽，按头部长度尽量保留可恢复前缀。
-   - `crates/xlog-core/src/buffer.rs`
-3. 追加写失败回滚：目标文件写入异常时回截到写前长度。
-   - `crates/xlog-core/src/file_manager.rs`
-4. cache->log 文件拼接失败回滚。
-   - `crates/xlog-core/src/file_manager.rs`
-
-### 2.2 引擎/生命周期行为
-
-5. async flush 信号去重，避免无界 flush 命令积压。
-   - `crates/xlog-core/src/appender_engine.rs`
-6. `Async -> Sync` 模式切换改为异步触发 flush，不再阻塞等待。
-   - `crates/xlog-core/src/appender_engine.rs`
-7. 时钟回拨时复用上次日志文件路径，避免回拨导致文件选择异常。
-   - `crates/xlog-core/src/file_manager.rs`
-8. cache 可用空间阈值边界改为 `>= 1GiB`（与 C++ 一致）。
-   - `crates/xlog-core/src/file_manager.rs`
-
-### 2.3 协议/加密语义
-
-9. sync + pubkey 场景改为 crypt magic + client_pubkey（payload 仍明文，符合 C++ 当前实现）。
-   - `crates/xlog/src/backend/rust.rs`
-10. 非法 server pubkey 改为降级 no-crypt（不再初始化失败）。
-    - `crates/xlog/src/backend/rust.rs`
-11. async seq 改为进程级全局序列（不再按 backend 实例）。
-    - `crates/xlog/src/backend/rust.rs`
-12. 压缩错误不再静默吞掉，失败时丢弃本次 block 构建。
-    - `crates/xlog/src/backend/rust.rs`
-
-### 2.4 控制台/API 语义
-
-13. console 输出补齐 metadata（level/tag/file/func/line），Android tag 改为逐条日志 tag。
-    - `crates/xlog-core/src/platform_console.rs`
-14. Apple `set_console_fun` 不再 no-op，Rust backend 已接入模式切换。
-    - `crates/xlog/src/backend/rust.rs`
-15. `dump` 在默认 appender 不可用时返回空串（不再回退到 `memory_dump`）。
-    - `crates/xlog/src/backend/rust.rs`
-16. 默认 appender `open` 改为幂等，并保留全局 max-size/max-alive/console 粘滞设置。
-    - `crates/xlog/src/backend/rust.rs`
-17. 路径 API 的空 `prefix` 不再隐式回退到 `name_prefix`。
-    - `crates/xlog-core/src/file_manager.rs`
-18. `oneshot_flush` 改为 exact-size mmap 读取语义（与 C++ 一致，截断返回 `ReadFailed`）。
-    - `crates/xlog-core/src/oneshot.rs`
-19. async 路径改为“单 pending block + 流式增量压缩/加密 + flush 封尾”模型（与 C++ 主行为对齐）。
-    - `crates/xlog/src/backend/rust.rs`
-    - `crates/xlog-core/src/appender_engine.rs`
-20. zstd async 压缩改为流式并显式设置 `windowLog=16`，按 chunk flush、block 结束时 end。
-    - `crates/xlog-core/src/compress.rs`
-    - `crates/xlog/src/backend/rust.rs`
-21. async 高水位（4/5）告警恢复为实际写入日志内容，并保持在同一 pending stream 内。
-    - `crates/xlog/src/backend/rust.rs`
-22. `write_async_pending` 在 `Async -> Sync` 并发切换下新增 `InvalidMode` 兜底直写，避免最后一块丢失。
-    - `crates/xlog/src/backend/rust.rs`
-23. async pending mmap 持久化改为批量刷盘（每 N 次或强制条件刷盘），降低每条写入 `msync` 开销。
-    - `crates/xlog-core/src/appender_engine.rs`
-    - `crates/xlog-core/src/buffer.rs`
-24. 后台线程 flush timeout 行为可配置（默认保持 15 分钟），便于稳定回归测试 timeout flush 语义。
-    - `crates/xlog-core/src/appender_engine.rs`
-25. formatter 截断语义改为对齐 C++ 16KB 栈缓冲路径（保留 130 bytes 安全余量），不再按 64KB body 上限直接截断。
-    - `crates/xlog-core/src/formatter.rs`
-26. `flush(sync=true)` 在 async 模式下改为 `move_file=false`，对齐 C++ `FlushSync` 的 cache->log 迁移行为。
-    - `crates/xlog-core/src/appender_engine.rs`
-27. async 4/5 高水位场景改为“替换当前待写日志为告警行”，不再追加额外告警块。
-    - `crates/xlog/src/backend/rust.rs`
-28. `filepaths_from_timespan` 移除额外排序，恢复 log_dir -> cache_dir 的遍历顺序语义。
-    - `crates/xlog-core/src/file_manager.rs`
-29. 启动 mmap 恢复与 oneshot 恢复补齐 begin/end tip 行，文案与 C++ 一致（含 mark info）。
-    - `crates/xlog-core/src/appender_engine.rs`
-    - `crates/xlog-core/src/oneshot.rs`
-30. Apple console 输出从 `eprintln!` 收敛为原生后端调用（OSLog/NSLog/printf shim）。
-    - `crates/xlog-core/src/platform_console.rs`
-    - `crates/xlog-core/src/apple_console_shim.mm`
+1. **`XLoggerInfo.traceLog` 旁路特性丢失**
+   - **差异**：在 C++ `appender.cc` 中，对于 Android 平台，如果传入的 `XLoggerInfo::traceLog == 1`，即使 `consolelog_open_ == false` 也会强行输出到 Logcat。
+   - **Rust 现状**：`mars-xlog-core::record::LogRecord` 尚未具有 `trace_log` 字段，且 `xlog` API 不支持旁路 Console 的独立判断。
+2. **`XloggerWrite(instance_ptr==0)` 的全局 Raw Metadata 写路径**
+   - **差异**：C++ 允许 JNI/FFI 层构建附带自定义 `pid` / `tid` / `maintid` 的 `XLoggerInfo` 并直接投递给 Global Appender。
+   - **Rust 现状**：Rust 封装的 `write_with_meta` 会在本地以 `std::process::id()` 强制复写被传入的元数据，导致 Android 绑定层拿到的 Java Thread ID 被抹去。
 
 ---
 
-## 3. 新增/调整回归测试
-
-- `crates/xlog-core/src/buffer.rs`
-  - `recover_pending_block_even_with_dirty_tail_bytes`
-- `crates/xlog-core/tests/async_engine.rs`
-  - `startup_drains_recovered_mmap_bytes_to_logfile`
-  - `async_timeout_flushes_pending_block_without_explicit_flush`
-  - `startup_recovers_pending_block_without_tailer`
-  - `flush_sync_keeps_cache_file_without_move`
-- `crates/xlog-core/tests/mmap_recovery.rs`
-  - 调整为 tailer torn 场景可恢复
-- `crates/xlog-core/tests/oneshot_flush.rs`
-  - 截断 mmap 改为 `ReadFailed`
-- `crates/xlog/src/backend/rust.rs`
-  - sync + pubkey 单测改为校验 crypt magic/client_pubkey
-  - 新增 async zlib/zstd 多条日志合流单 block 回归
-  - 新增 async crypt(zlib/zstd) 可解码、Async->Sync 不丢日志、高水位告警注入回归
-  - 高水位回归调整为“替换当前日志为告警行”
-- `crates/xlog-core/tests/compress_roundtrip.rs`
-  - zstd 回归改为流式 compressor
-- `crates/xlog-core/src/file_manager.rs`
-  - 新增 `filepaths_from_timespan_keeps_log_then_cache_order` 顺序回归
-
----
-
-## 4. 仍待对齐项（本轮未完全收口）
-
-1. **`traceLog` 旁路 console 语义未接入**：Rust 目前无完整 `XLoggerInfo.traceLog` 等价入口。
-2. **`XloggerWrite(instance_ptr==0)` 原语义未完全暴露**：Rust API 仍以 handle 写入为主，缺少完整 raw metadata 写路径。
-3. **绑定层覆盖面仍小于 C++ 接口面**：UniFFI/NAPI 仍缺少部分控制/检索/维护能力。
-
----
-
-## 5. 建议下一步
-
-1. 在 API 层补齐 raw info/default instance 写入与 traceLog 语义。
-2. 同步扩展 UniFFI/NAPI 覆盖，保持跨绑定行为一致。
+由于上述 2 项系本轮比对的最后差异，我们已制定实施计划准备对其修复。
