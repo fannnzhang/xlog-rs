@@ -343,6 +343,10 @@ impl FileManager {
         Ok(())
     }
 
+    pub fn flush_active_file_buffer(&self) -> Result<(), FileManagerError> {
+        self.flush_active_file_if_needed()
+    }
+
     fn delete_expired_under(
         &self,
         dir: &Path,

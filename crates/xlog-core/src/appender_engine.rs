@@ -18,10 +18,12 @@ use crate::protocol::{
 };
 
 const DEFAULT_ASYNC_FLUSH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-const ASYNC_PENDING_MMAP_PERSIST_EVERY_UPDATES: u32 = 32;
-const ASYNC_PENDING_MMAP_PERSIST_EVERY_BYTES: usize = 32 * 1024;
-const ASYNC_PENDING_MMAP_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
-const ASYNC_FLUSH_RETRY_DELAY: Duration = Duration::from_millis(1);
+const ASYNC_PENDING_MMAP_PERSIST_EVERY_UPDATES: u32 = 64;
+const ASYNC_PENDING_MMAP_PERSIST_EVERY_BYTES: usize = 64 * 1024;
+const ASYNC_PENDING_MMAP_PERSIST_INTERVAL: Duration = Duration::from_millis(500);
+const ASYNC_FLUSH_RETRY_DELAY: Duration = Duration::from_micros(100);
+const ASYNC_BUFFER_FLUSH_THRESHOLD_NUM: usize = 1;
+const ASYNC_BUFFER_FLUSH_THRESHOLD_DEN: usize = 3;
 const MIN_LOG_ALIVE_SECONDS: i64 = 24 * 60 * 60;
 const EXPIRED_SWEEP_INTERVAL: Duration = Duration::from_secs(2 * 60);
 const CACHE_MOVE_INTERVAL: Duration = Duration::from_secs(3 * 60);
@@ -168,7 +170,7 @@ impl AppenderEngine {
     pub fn set_mode(&self, mode: EngineMode) -> Result<(), AppenderEngineError> {
         let old = i32_to_mode(self.mode.swap(mode_to_i32(mode), Ordering::Relaxed));
         if old == EngineMode::Async && mode == EngineMode::Sync {
-            self.request_flush(false, true)?;
+            self.request_flush(true, true)?;
         }
         Ok(())
     }
@@ -257,7 +259,7 @@ impl AppenderEngine {
                         }
                     }
 
-                    let threshold = state.buffer.capacity() / 3;
+                    let threshold = async_buffer_flush_threshold(state.buffer.capacity());
                     force_flush || state.buffer.len() >= threshold
                 };
 
@@ -302,7 +304,7 @@ impl AppenderEngine {
         }
         let should_flush = {
             let mut state = self.state.lock().expect("state lock poisoned");
-            let threshold = state.buffer.capacity() / 3;
+            let threshold = async_buffer_flush_threshold(state.buffer.capacity());
             let next_len = state
                 .buffer
                 .len()
@@ -400,7 +402,7 @@ impl AppenderEngine {
         }
         let should_flush = {
             let mut state = self.state.lock().expect("state lock poisoned");
-            let threshold = state.buffer.capacity() / 3;
+            let threshold = async_buffer_flush_threshold(state.buffer.capacity());
             let should_flush = force_flush || pending_bytes.len() >= threshold;
 
             state.async_pending_updates_since_persist =
@@ -427,6 +429,9 @@ impl AppenderEngine {
 
     pub fn flush(&self, sync: bool) -> Result<(), AppenderEngineError> {
         if self.mode() == EngineMode::Sync {
+            if sync {
+                self.file_manager.flush_active_file_buffer()?;
+            }
             return Ok(());
         }
         self.request_flush(sync, !sync)
@@ -566,6 +571,7 @@ fn flush_pending_locked(
             state.buffer.clear_used_with_flush(true)?;
             return Ok(false);
         }
+        let keep_open = false;
 
         let sample_header = {
             let pending = state.buffer.as_bytes();
@@ -580,7 +586,7 @@ fn flush_pending_locked(
             {
                 state
                     .file_manager
-                    .append_log_bytes(&begin, state.max_file_size, false, false)?;
+                    .append_log_bytes(&begin, state.max_file_size, false, keep_open)?;
             }
         }
 
@@ -596,14 +602,14 @@ fn flush_pending_locked(
                     &recovered,
                     state.max_file_size,
                     move_file,
-                    false,
+                    keep_open,
                 )?;
             } else {
                 state.file_manager.append_log_bytes(
                     &pending[..scan.valid_len],
                     state.max_file_size,
                     move_file,
-                    false,
+                    keep_open,
                 )?;
             }
         }
@@ -616,7 +622,7 @@ fn flush_pending_locked(
                     &end_block,
                     state.max_file_size,
                     false,
-                    false,
+                    keep_open,
                 )?;
             }
         }
@@ -636,6 +642,13 @@ fn mark_async_mmap_persisted(state: &mut EngineState) {
     state.async_pending_updates_since_persist = 0;
     state.async_pending_bytes_since_persist = 0;
     state.last_async_buffer_persist_at = Instant::now();
+}
+
+fn async_buffer_flush_threshold(capacity: usize) -> usize {
+    let threshold = capacity
+        .saturating_mul(ASYNC_BUFFER_FLUSH_THRESHOLD_NUM)
+        / ASYNC_BUFFER_FLUSH_THRESHOLD_DEN.max(1);
+    threshold.max(1)
 }
 
 fn handle_timeout_locked(
