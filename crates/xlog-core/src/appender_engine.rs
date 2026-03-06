@@ -21,6 +21,7 @@ const DEFAULT_ASYNC_FLUSH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const ASYNC_PENDING_MMAP_PERSIST_EVERY_UPDATES: u32 = 32;
 const ASYNC_PENDING_MMAP_PERSIST_EVERY_BYTES: usize = 32 * 1024;
 const ASYNC_PENDING_MMAP_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
+const ASYNC_FLUSH_RETRY_DELAY: Duration = Duration::from_millis(1);
 const MIN_LOG_ALIVE_SECONDS: i64 = 24 * 60 * 60;
 const EXPIRED_SWEEP_INTERVAL: Duration = Duration::from_secs(2 * 60);
 const CACHE_MOVE_INTERVAL: Duration = Duration::from_secs(3 * 60);
@@ -122,6 +123,7 @@ impl AppenderEngine {
             let _ = flush_pending_locked(&mut state_guard, false, true);
         }
         let (tx, rx) = unbounded();
+        let worker_tx = tx.clone();
         let pending_async_flush = Arc::new(AtomicBool::new(false));
         let async_flush_epoch = Arc::new(AtomicU64::new(0));
         let worker_state = Arc::clone(&state);
@@ -133,6 +135,7 @@ impl AppenderEngine {
                 run_worker_loop(
                     worker_state,
                     rx,
+                    worker_tx,
                     worker_pending_flag,
                     worker_flush_epoch,
                     flush_timeout,
@@ -478,6 +481,7 @@ impl Drop for AppenderEngine {
 fn run_worker_loop(
     state: Arc<Mutex<EngineState>>,
     rx: Receiver<EngineCommand>,
+    tx: Sender<EngineCommand>,
     pending_async_flush: Arc<AtomicBool>,
     async_flush_epoch: Arc<AtomicU64>,
     flush_timeout: Duration,
@@ -486,14 +490,31 @@ fn run_worker_loop(
     loop {
         match rx.recv_timeout(poll_interval) {
             Ok(EngineCommand::Flush { move_file, ack }) => {
-                pending_async_flush.store(false, Ordering::Release);
-                let flushed = state
-                    .lock()
-                    .map_err(|_| ())
-                    .and_then(|mut s| {
-                        flush_pending_locked(&mut s, move_file, false).map_err(|_| ())
-                    })
-                    .unwrap_or(false);
+                let flushed = if ack.is_some() {
+                    pending_async_flush.store(false, Ordering::Release);
+                    state
+                        .lock()
+                        .map_err(|_| ())
+                        .and_then(|mut s| {
+                            flush_pending_locked(&mut s, move_file, false).map_err(|_| ())
+                        })
+                        .unwrap_or(false)
+                } else {
+                    match state.try_lock() {
+                        Ok(mut s) => {
+                            pending_async_flush.store(false, Ordering::Release);
+                            flush_pending_locked(&mut s, move_file, false).map_err(|_| ()).unwrap_or(false)
+                        }
+                        Err(_) => {
+                            thread::sleep(ASYNC_FLUSH_RETRY_DELAY);
+                            let _ = tx.send(EngineCommand::Flush {
+                                move_file,
+                                ack: None,
+                            });
+                            continue;
+                        }
+                    }
+                };
                 if flushed {
                     async_flush_epoch.fetch_add(1, Ordering::AcqRel);
                 }
@@ -520,7 +541,7 @@ fn run_worker_loop(
             }
             Err(RecvTimeoutError::Timeout) => {
                 let flushed = state
-                    .lock()
+                    .try_lock()
                     .map_err(|_| ())
                     .and_then(|mut s| handle_timeout_locked(&mut s, flush_timeout).map_err(|_| ()))
                     .unwrap_or(false);
