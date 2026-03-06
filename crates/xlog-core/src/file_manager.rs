@@ -11,6 +11,7 @@ use thiserror::Error;
 
 const LOG_EXT: &str = "xlog";
 const CACHE_AVAILABLE_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
+const ACTIVE_APPEND_BUFFER_CAPACITY: usize = libc::BUFSIZ as usize;
 
 #[derive(Debug, Error)]
 pub enum FileManagerError {
@@ -58,8 +59,21 @@ struct RuntimeState {
 struct ActiveAppendFile {
     path: PathBuf,
     day_key: i32,
-    len: u64,
+    logical_len: u64,
+    disk_len: u64,
+    buffered: bool,
+    write_buffer: Vec<u8>,
     file: File,
+}
+
+impl Drop for ActiveAppendFile {
+    fn drop(&mut self) {
+        if self.write_buffer.is_empty() {
+            return;
+        }
+        let _ = self.file.write_all(&self.write_buffer);
+        self.write_buffer.clear();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -262,6 +276,8 @@ impl FileManager {
             return Ok(());
         }
 
+        self.flush_active_file_if_needed()?;
+
         let now = SystemTime::now();
         let entries =
             fs::read_dir(cache_dir).map_err(|e| FileManagerError::ReadDir(cache_dir.clone(), e))?;
@@ -302,6 +318,7 @@ impl FileManager {
         if max_alive_seconds <= 0 {
             return Ok(());
         }
+        self.flush_active_file_if_needed()?;
         let threshold = Duration::from_secs(max_alive_seconds as u64);
         self.delete_expired_under(&self.log_dir, threshold)?;
         if let Some(cache_dir) = &self.cache_dir {
@@ -369,6 +386,17 @@ impl FileManager {
             }
         }
         out
+    }
+
+    fn flush_active_file_if_needed(&self) -> Result<(), FileManagerError> {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .expect("file_manager runtime lock poisoned");
+        if let Some(active) = runtime.active_file.as_mut() {
+            flush_active_append_file(active)?;
+        }
+        Ok(())
     }
 
     fn cached_target<'a>(
@@ -686,7 +714,7 @@ impl FileManager {
             .map(|active| active.path != path_buf || active.day_key != day_key)
             .unwrap_or(false);
         if must_reopen {
-            runtime.active_file = None;
+            close_active_append_file(runtime)?;
         }
         if runtime.active_file.is_none() {
             let file = open_append_file(path, &path_buf)?;
@@ -700,46 +728,37 @@ impl FileManager {
             runtime.active_file = Some(ActiveAppendFile {
                 path: path_buf.clone(),
                 day_key,
-                len,
+                logical_len: len,
+                disk_len: len,
+                buffered: keep_open,
+                write_buffer: Vec::with_capacity(if keep_open {
+                    ACTIVE_APPEND_BUFFER_CAPACITY
+                } else {
+                    0
+                }),
                 file,
             });
         }
 
+        let written = slices.iter().map(|slice| slice.len() as u64).sum::<u64>();
         let result = {
             let active = runtime.active_file.as_mut().expect("active file initialized");
-            let before_len = active.len;
-            let mut written = 0u64;
-            let mut failure = None;
-            for slice in slices {
-                if slice.is_empty() {
-                    continue;
-                }
-                if let Err(e) = active.file.write_all(slice) {
-                    failure = Some(e);
-                    break;
-                }
-                written = written.saturating_add(slice.len() as u64);
+            if keep_open {
+                append_slices_keep_open(active, slices)?;
+            } else {
+                append_slices_direct(active, slices)?;
             }
-            match failure {
-                None => {
-                    active.len = before_len.saturating_add(written);
-                    Ok((written, active.len))
-                }
-                Some(e) => {
-                    rollback_file_to_len(&mut active.file, before_len);
-                    Err(FileManagerError::WriteFile(path_buf.clone(), e))
-                }
-            }
+            Ok::<u64, FileManagerError>(active.logical_len)
         };
 
-        if let Ok((written, current_len)) = result {
+        if let Ok(current_len) = result {
             let merged_len =
                 self.merged_len_after_append(path, runtime, day_key, written, current_len);
             self.update_cached_target_after_append(runtime, path, day_key, merged_len, current_len);
         }
 
         if !keep_open {
-            runtime.active_file = None;
+            close_active_append_file(runtime)?;
         }
 
         result.map(|_| ())
@@ -1004,6 +1023,100 @@ fn append_file_to_file(src: &Path, dst: &Path) -> Result<(), FileManagerError> {
     Ok(())
 }
 
+fn close_active_append_file(runtime: &mut RuntimeState) -> Result<(), FileManagerError> {
+    if let Some(active) = runtime.active_file.as_mut() {
+        flush_active_append_file(active)?;
+    }
+    runtime.active_file = None;
+    Ok(())
+}
+
+fn append_slices_keep_open(
+    active: &mut ActiveAppendFile,
+    slices: &[&[u8]],
+) -> Result<(), FileManagerError> {
+    let incoming = slices.iter().map(|slice| slice.len()).sum::<usize>();
+    if incoming == 0 {
+        return Ok(());
+    }
+
+    if !active.buffered {
+        active.buffered = true;
+        active.write_buffer
+            .reserve(ACTIVE_APPEND_BUFFER_CAPACITY.max(incoming));
+    }
+
+    if !active.write_buffer.is_empty()
+        && active.write_buffer.len().saturating_add(incoming) >= ACTIVE_APPEND_BUFFER_CAPACITY
+    {
+        flush_active_append_file(active)?;
+    }
+
+    if incoming >= ACTIVE_APPEND_BUFFER_CAPACITY {
+        append_slices_direct(active, slices)?;
+        return Ok(());
+    }
+
+    for slice in slices {
+        if slice.is_empty() {
+            continue;
+        }
+        active.write_buffer.extend_from_slice(slice);
+        active.logical_len = active.logical_len.saturating_add(slice.len() as u64);
+    }
+    Ok(())
+}
+
+fn append_slices_direct(
+    active: &mut ActiveAppendFile,
+    slices: &[&[u8]],
+) -> Result<(), FileManagerError> {
+    if !active.write_buffer.is_empty() {
+        flush_active_append_file(active)?;
+    }
+
+    let before_len = active.disk_len;
+    let mut written = 0u64;
+    let mut failure = None;
+    for slice in slices {
+        if slice.is_empty() {
+            continue;
+        }
+        if let Err(e) = active.file.write_all(slice) {
+            failure = Some(e);
+            break;
+        }
+        written = written.saturating_add(slice.len() as u64);
+    }
+
+    match failure {
+        None => {
+            active.disk_len = before_len.saturating_add(written);
+            active.logical_len = active.disk_len;
+            Ok(())
+        }
+        Some(e) => {
+            rollback_file_to_len(&mut active.file, before_len);
+            Err(FileManagerError::WriteFile(active.path.clone(), e))
+        }
+    }
+}
+
+fn flush_active_append_file(active: &mut ActiveAppendFile) -> Result<(), FileManagerError> {
+    if active.write_buffer.is_empty() {
+        return Ok(());
+    }
+
+    let before_len = active.disk_len;
+    if let Err(e) = active.file.write_all(&active.write_buffer) {
+        rollback_file_to_len(&mut active.file, before_len);
+        return Err(FileManagerError::WriteFile(active.path.clone(), e));
+    }
+    active.disk_len = active.logical_len;
+    active.write_buffer.clear();
+    Ok(())
+}
+
 fn rollback_file_to_len(file: &mut File, target_len: u64) {
     let _ = file.set_len(target_len);
     let _ = file.seek(SeekFrom::Start(target_len));
@@ -1071,13 +1184,14 @@ mod tests {
     }
 
     #[test]
-    fn keep_open_reuses_same_sync_file_within_day() {
+    fn keep_open_flushes_buffer_when_closed() {
         let root = tempfile::tempdir().unwrap();
         let log_dir = root.path().join("log");
         let manager = FileManager::new(log_dir.clone(), None, "demo".to_string(), 0).unwrap();
 
-        manager.append_log_bytes(b"aaaa", 1, false, true).unwrap();
-        manager.append_log_bytes(b"bbbb", 1, false, true).unwrap();
+        manager.append_log_bytes(b"aaaa", 0, false, true).unwrap();
+        manager.append_log_bytes(b"bbbb", 0, false, true).unwrap();
+        manager.append_log_bytes(b"cccc", 0, false, false).unwrap();
 
         let entries = std::fs::read_dir(&log_dir)
             .unwrap()
@@ -1085,7 +1199,7 @@ mod tests {
             .filter(|path| path.extension().and_then(std::ffi::OsStr::to_str) == Some("xlog"))
             .collect::<Vec<_>>();
         assert_eq!(entries.len(), 1);
-        assert_eq!(std::fs::read(&entries[0]).unwrap(), b"aaaabbbb");
+        assert_eq!(std::fs::read(&entries[0]).unwrap(), b"aaaabbbbcccc");
     }
 
     #[test]
@@ -1167,7 +1281,10 @@ mod tests {
             runtime.active_file = Some(ActiveAppendFile {
                 path: cache_path.clone(),
                 day_key: day,
-                len: 4,
+                logical_len: 4,
+                disk_len: 4,
+                buffered: true,
+                write_buffer: Vec::with_capacity(super::ACTIVE_APPEND_BUFFER_CAPACITY),
                 file: OpenOptions::new().append(true).open(&cache_path).unwrap(),
             });
             runtime.cache_target = Some(AppendTargetCache {
@@ -1189,13 +1306,14 @@ mod tests {
         }
 
         manager.append_log_bytes(b"bbbb", 0, false, true).unwrap();
+        manager.append_log_bytes(b"cccc", 0, false, false).unwrap();
 
         let cache_entries = std::fs::read_dir(&cache_dir)
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect::<Vec<_>>();
         assert_eq!(cache_entries, vec![cache_path.clone()]);
-        assert_eq!(std::fs::read(&cache_path).unwrap(), b"aaaabbbb");
+        assert_eq!(std::fs::read(&cache_path).unwrap(), b"aaaabbbbcccc");
         assert!(!root.path().join("bogus").exists());
         assert!(std::fs::read_dir(&log_dir).unwrap().next().is_none());
     }
