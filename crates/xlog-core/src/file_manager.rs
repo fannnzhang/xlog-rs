@@ -201,6 +201,11 @@ impl FileManager {
         if self.cache_dir.is_none() {
             let now = Local::now();
             let mut runtime = self.runtime.lock().expect("file_manager runtime lock poisoned");
+            if keep_open
+                && self.try_append_active_plain_keep_open(&mut runtime, slices, now, max_file_size)?
+            {
+                return Ok(());
+            }
             let path = self.select_append_path_locked(
                 &mut runtime,
                 now,
@@ -497,6 +502,38 @@ impl FileManager {
             return None;
         }
         Some(target.local_exists)
+    }
+
+    fn try_append_active_plain_keep_open(
+        &self,
+        runtime: &mut RuntimeState,
+        slices: &[&[u8]],
+        now: chrono::DateTime<Local>,
+        max_file_size: u64,
+    ) -> Result<bool, FileManagerError> {
+        let active = match runtime.active_file.as_mut() {
+            Some(active) => active,
+            None => return Ok(false),
+        };
+        if active.day_key != day_key(now) {
+            return Ok(false);
+        }
+        if active.path.parent() != Some(self.log_dir.as_path()) {
+            return Ok(false);
+        }
+        if max_file_size > 0 && active.logical_len > max_file_size {
+            return Ok(false);
+        }
+
+        append_slices_keep_open(active, slices)?;
+        if let Some(target) = runtime.log_target.as_mut() {
+            if target.day_key == active.day_key && target.path == active.path {
+                target.local_exists = true;
+                target.local_len = active.logical_len;
+                target.merged_len = active.logical_len;
+            }
+        }
+        Ok(true)
     }
 
     fn update_cached_target_after_append(
