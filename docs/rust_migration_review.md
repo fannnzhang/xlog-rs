@@ -63,6 +63,11 @@
    - 这条本轮也已落地。benchmark example 已支持 compile-time Rust/C++ backend 选择，并补齐 `--threads`、`--flush-every` 等参数；同轮 threaded smoke 也已经恢复。
    - 这让后续性能结论不再完全依赖历史基线，而能直接基于同参数 A/B。
 
+4. **[Sync Steady-State] 收窄 engine/file-manager 热路径锁作用域**
+   - 这条在新矩阵下已经证明有价值。plain sync 的主差距并不主要落在轮转边界，而是 steady-state 热路径里把 `AppenderEngine` / `FileManager` 锁持有到文件 I/O 完成。
+   - 当前已经先落了一阶段：sync 写入改为先 snapshot `AppenderEngine` 配置再锁外 append；`FileManager` plain 路径收敛到单次 runtime 锁，目录创建下沉到 `open(NotFound)` 兜底。
+   - 结果是 plain sync `1T / 4T` 都有实质提升，说明这个方向比继续抠边界探测更值钱。
+
 ### 5.2 仍有价值，但要先做 profiling 再决定
 
 1. **[AppenderEngine::state] 继续收窄 engine 串行区**
@@ -74,8 +79,8 @@
    - 在当前阶段，先没有证据表明它比减少内存复制、减少目录扫描更值钱，因此只保留为实验项，不进入当前主线。
 
 3. **[FileManager] 继续减少轮转边界和 cache/log 切换边界探测**
-   - 这条仍然值钱，但已经从“热路径每次都探测”收敛为“主要集中在边界时刻的探测”。
-   - 下一步应继续把边界上的 `metadata / read_dir / path-select` 探测压缩到更少的失效点，而不是重新改大结构。
+   - 这条仍然有价值，但优先级已经下调。新的多轮矩阵显示，Rust sync 在 plain steady-state 下也明显落后，而 rotate/cache 边界带来的额外损耗反而不是当前最大项。
+   - 所以下一步不应再把边界探测当成 `P0`，而应把它视为 steady-state 问题收敛后的后续项。
 
 ### 5.3 当前价值不高，暂不进入主线
 
@@ -103,10 +108,11 @@
 2. FileManager：引入按目录/按天的 append target cache，并补上活跃 cache 文件 fast path。
 3. benchmark：恢复 compile-time Rust/C++ backend harness，并支持 threaded smoke。
 4. AppenderEngine：后台 async flush 在 busy state 时改为 `try_lock + requeue`。
+5. sync steady-state：`AppenderEngine` 锁外执行文件写入，`FileManager` plain 热路径收敛到单次 runtime 锁。
 
 下一步只保留两类内容：
 
-1. sync 边界探测继续收敛。
+1. sync plain steady-state 继续收敛，优先压活跃文件写入串行区。
 2. 基于新的 threaded benchmark，对 `AppenderEngine::state` 是否继续拆分做 profiling 决策。
 
 其余优化想法保留在文档中，但默认视为“实验项”或“后置项”，不再并行扩散实现范围。

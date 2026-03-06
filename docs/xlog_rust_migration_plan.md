@@ -605,6 +605,8 @@ P2/P3 执行后快照（2026-03-06，`artifacts/bench-compare/20260306-perf5`，
 | `20260306-p0p1wave` | sync Rust（4 threads smoke） | 117,198.59 | 29,534.00 | 484,792.00 | 同上；仅用于验证 harness 与当前实现路径，不替换阶段基线 |
 | `20260306-p0p1wave` | async C++（4 threads smoke） | 157,537.94 | 24,974.10 | 246,916.00 | 同上；首次恢复同轮同参数 smoke 对照 |
 | `20260306-p0p1wave` | sync C++（4 threads smoke） | 256,480.81 | 14,460.13 | 160,000.00 | 同上；仅 smoke，不作为阶段结论 |
+| `20260306-harness-matrix` | sync Rust（plain 1T / 4T） | 161,859.15 / 133,643.58 | 5,882.66 / 27,437.78 | 44,610.67 / 189,277.33 | 新 harness 多轮矩阵；用于诊断 sync 主差距位置 |
+| `20260306-syncsteady-perf2` | sync Rust（plain 1T / 4T） | 220,175.70 / 167,391.97 | 4,233.15 / 20,882.39 | 24,180.33 / 194,805.67 | sync steady-state 锁作用域/热路径 syscall 收敛后的重跑 |
 
 当前有效对齐结论（Rust 对保留 C++ 基线）：
 
@@ -612,6 +614,7 @@ P2/P3 执行后快照（2026-03-06，`artifacts/bench-compare/20260306-perf5`，
 - sync：以 `20260306-perf6` 为当前参考，Rust 吞吐约为 C++ 的 39.4%，平均延迟约 2.77x，p99 约 1.33x。
 - 说明：`20260306-perf8` 仍作为 async 主参考；`20260306-perf9` 主要验证边界路径复制收敛，p99 略降但均值受环境波动影响，不提升为阶段基线。sync 当前仍采用 `20260306-perf6` 作为阶段参考。
 - `20260306-p0p1wave` 已恢复同轮 Rust/C++ threaded smoke，对照不再完全依赖历史产物；但由于仅单次 smoke、线程数和消息规模与阶段主基线不同，不替换上述阶段参考。
+- `20260306-harness-matrix` 与 `20260306-syncsteady-perf2` 表明：sync 的主差距不在轮转边界，而在 plain steady-state 热路径；本轮 steady-state 优化后，Rust sync plain `1T / 4T` 已提升到约 C++ 的 `59.7% / 62.2%`。
 
 Phase 6 已完成项（仅保留仍有信息价值的条目）：
 
@@ -625,12 +628,14 @@ Phase 6 已完成项（仅保留仍有信息价值的条目）：
 8. `PersistentBuffer` 启动恢复与 `oneshot_flush` 已改为 scan + slice 路径，避免整段 `recover_blocks()`/`read_exact()` 复制；async finalize 空尾块不再执行无意义 append。
 9. `AppenderEngine` 后台 async flush 在 state 忙时改为 `try_lock + requeue`，避免 flush worker 在热写入期间长时间阻塞主串行区。
 10. benchmark harness 已恢复 compile-time Rust/C++ backend 选择，并补齐 `--threads`、`--flush-every` 等 threaded smoke 能力。
+11. sync steady-state 写入已改为先 snapshot `AppenderEngine` 配置，再锁外执行文件 append，避免将 engine 锁持有到文件 I/O 完成。
+12. `FileManager` plain sync 热路径已收敛到单次 runtime 锁；steady-state 不再重复做 `active_append_path + append_slices_with_runtime` 双锁往返，目录创建也下沉到 `open(NotFound)` 兜底重试。
 
 当前剩余差距（只保留主计划内仍值得做的项）：
 
-1. sync：轮转边界和 cache/log 切换边界仍有额外 metadata/path 探测。
-2. benchmark：虽已恢复同轮 Rust/C++ smoke，但仍缺少多轮统计化基准与更完整的场景矩阵。
-3. async：`AppenderEngine::state` 仍保留必要串行区，后续是否继续拆分需要结合新的 threaded profiling 决定。
+1. sync：plain steady-state 仍明显落后 C++，当前主差距更像 `FileManager::runtime` 与活跃文件写入的串行区，而不是轮转边界探测。
+2. benchmark：已具备多轮诊断矩阵，但仍缺少整理后的长期基线与自动回归门槛。
+3. async：`AppenderEngine::state` 仍保留必要串行区，flush overlap 与单线程 p99 仍需要后续 profiling 决定是否继续拆分。
 
 性能优化约束（必须遵守）：
 
@@ -650,8 +655,10 @@ Phase 6 已完成项（仅保留仍有信息价值的条目）：
 | 已完成 | 收敛 finalize / recover / oneshot 边界复制与尾块处理 | `crates/xlog/src/backend/rust.rs`、`crates/xlog-core/src/buffer.rs`、`crates/xlog-core/src/oneshot.rs` | `cargo test -p mars-xlog-core --test mmap_recovery --test oneshot_flush -- --nocapture` 通过；见 `20260306-perf9` |
 | 已完成 | `AppenderEngine` async flush worker 改为 busy 时 `try_lock + requeue` | `crates/xlog-core/src/appender_engine.rs` | `cargo test -p mars-xlog-core --test async_engine -- --nocapture` 通过 |
 | 已完成 | 恢复独立 C++ backend benchmark harness，并补齐 threaded benchmark 入口 | `crates/xlog/Cargo.toml`、`crates/xlog/src/backend/mod.rs`、`crates/xlog/examples/bench_backend.rs`、`scripts/xlog/run_phase5_regression.sh` | `cargo check -p mars-xlog --example bench_backend --no-default-features --features rust-backend/cpp-backend` 通过；见 `20260306-p0p1wave/results_smoke.jsonl` |
-| 进行中 | 继续减少 sync 轮转边界的 metadata/path 探测 | `crates/xlog-core/src/file_manager.rs` | 目标：提升 sync 吞吐稳定性 |
-| 待执行 | 把同轮 Rust/C++ threaded smoke 扩展为多轮统计基准 | `crates/xlog/examples/bench_backend.rs`、`scripts/xlog/*` | 目标：形成稳定 A/B 结论，而不只是 smoke |
+| 已完成 | sync steady-state：`AppenderEngine` 锁外执行文件写入 + `FileManager` plain 热路径收敛到单次 runtime 锁 | `crates/xlog-core/src/appender_engine.rs`、`crates/xlog-core/src/file_manager.rs` | `cargo check -p mars-xlog-core -p mars-xlog`、`cargo test -p mars-xlog-core file_manager:: -- --nocapture` 通过；见 `20260306-syncsteady-perf2/results_raw.jsonl` |
+| 已完成 | 同轮 Rust/C++ 多轮诊断矩阵（1T/4T/flush overlap/rotate/cache） | `crates/xlog/examples/bench_backend.rs`、`artifacts/bench-compare/20260306-harness-matrix/*` | 产物：`results_raw.jsonl`、`summary.md` |
+| 进行中 | 继续缩小 sync plain steady-state 与 C++ 的差距 | `crates/xlog-core/src/file_manager.rs`、`crates/xlog-core/src/appender_engine.rs` | 目标：进一步压缩活跃文件写入串行区 |
+| 待执行 | 基于诊断矩阵继续定位 async flush overlap 与单线程 p99 | `crates/xlog-core/src/appender_engine.rs`、`crates/xlog/src/backend/rust.rs` | 目标：确定是否继续拆分 `EngineState` |
 
 已从主计划移除（不再进入当前实现排期）：
 
