@@ -2,8 +2,9 @@ use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use chrono::Local;
+use chrono::{Local, TimeZone};
 use mars_xlog_core::appender_engine::{AppenderEngine, EngineMode};
 use mars_xlog_core::buffer::{PersistentBuffer, DEFAULT_BUFFER_BLOCK_LEN};
 use mars_xlog_core::compress::{StreamCompressor, ZlibStreamCompressor, ZstdStreamCompressor};
@@ -31,7 +32,8 @@ use mars_xlog_core::registry::InstanceRegistry;
 
 use super::{XlogBackend, XlogBackendProvider};
 use crate::{
-    AppenderMode, CompressMode, FileIoAction, LogLevel, RawLogMeta, XlogConfig, XlogError,
+    AppenderMode, CompressMode, FileIoAction, LogLevel, RawLogMeta, RustSyncStageStats,
+    StageLatencyStats, XlogConfig, XlogError,
 };
 
 #[cfg(any(
@@ -273,13 +275,162 @@ fn with_hot_path_scratch<R>(f: impl FnOnce(&mut HotPathScratch) -> R) -> R {
     })
 }
 
+#[derive(Default)]
+struct HourCache {
+    epoch_second: i64,
+    hour: u8,
+    valid: bool,
+}
+
+thread_local! {
+    static HOUR_CACHE: RefCell<HourCache> = RefCell::new(HourCache {
+        epoch_second: 0,
+        hour: 0,
+        valid: false,
+    });
+}
+
+#[derive(Copy, Clone)]
+struct SyncStageSample {
+    total_ns: u64,
+    format_ns: u64,
+    block_ns: u64,
+    engine_write_ns: u64,
+}
+
+#[derive(Default)]
+struct SyncBuildStage {
+    format_ns: u64,
+    block_ns: u64,
+}
+
+struct SyncStageProfiler {
+    enabled: AtomicBool,
+    samples: Mutex<Vec<SyncStageSample>>,
+}
+
+impl SyncStageProfiler {
+    fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            samples: Mutex::new(Vec::new()),
+        }
+    }
+}
+
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 static GLOBAL_MAX_FILE_SIZE: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_MAX_ALIVE_TIME: AtomicI64 = AtomicI64::new(0);
 static GLOBAL_CONSOLE_OPEN: AtomicBool = AtomicBool::new(false);
+static SYNC_STAGE_PROFILER: OnceLock<SyncStageProfiler> = OnceLock::new();
 
 const ASYNC_WARNING_THRESHOLD_NUM: usize = 4;
 const ASYNC_WARNING_THRESHOLD_DEN: usize = 5;
+
+fn sync_stage_profiler() -> &'static SyncStageProfiler {
+    SYNC_STAGE_PROFILER.get_or_init(SyncStageProfiler::new)
+}
+
+fn sync_stage_profile_enabled() -> bool {
+    sync_stage_profiler().enabled.load(Ordering::Relaxed)
+}
+
+fn record_sync_stage_sample(sample: SyncStageSample) {
+    let profiler = sync_stage_profiler();
+    if !profiler.enabled.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Ok(mut samples) = profiler.samples.lock() {
+        samples.push(sample);
+    }
+}
+
+fn local_hour_from_timestamp(timestamp: SystemTime) -> u8 {
+    if let Ok(since_epoch) = timestamp.duration_since(UNIX_EPOCH) {
+        let epoch_secs = since_epoch.as_secs();
+        if epoch_secs <= i64::MAX as u64 {
+            let epoch_second = epoch_secs as i64;
+            return HOUR_CACHE.with(|cache_cell| {
+                let mut cache = cache_cell.borrow_mut();
+                if !cache.valid || cache.epoch_second != epoch_second {
+                    if let Some(dt) = chrono::Local.timestamp_opt(epoch_second, 0).single() {
+                        cache.epoch_second = epoch_second;
+                        cache.hour = chrono::Timelike::hour(&dt) as u8;
+                        cache.valid = true;
+                    } else {
+                        return chrono::Timelike::hour(&chrono::Local::now()) as u8;
+                    }
+                }
+                cache.hour
+            });
+        }
+    }
+    chrono::Timelike::hour(&chrono::Local::now()) as u8
+}
+
+fn stage_stats(values: &mut [u64]) -> StageLatencyStats {
+    if values.is_empty() {
+        return StageLatencyStats::default();
+    }
+    values.sort_unstable();
+    let len = values.len();
+    let sum = values
+        .iter()
+        .fold(0u128, |acc, &v| acc.saturating_add(v as u128));
+    StageLatencyStats {
+        avg_ns: sum as f64 / len as f64,
+        p50_ns: percentile_from_sorted(values, 500),
+        p95_ns: percentile_from_sorted(values, 950),
+        p99_ns: percentile_from_sorted(values, 990),
+        max_ns: *values.last().unwrap_or(&0),
+    }
+}
+
+fn percentile_from_sorted(sorted: &[u64], per_mille: usize) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let last = sorted.len().saturating_sub(1);
+    let idx = ((last as u128 * per_mille as u128) / 1000u128) as usize;
+    sorted[idx.min(last)]
+}
+
+pub(super) fn set_sync_stage_profile_enabled(enabled: bool) {
+    let profiler = sync_stage_profiler();
+    profiler.enabled.store(enabled, Ordering::Relaxed);
+    if let Ok(mut samples) = profiler.samples.lock() {
+        samples.clear();
+    }
+}
+
+pub(super) fn take_sync_stage_stats() -> Option<RustSyncStageStats> {
+    let profiler = sync_stage_profiler();
+    let mut samples = profiler.samples.lock().ok()?;
+    if samples.is_empty() {
+        return None;
+    }
+    let snapshot = std::mem::take(&mut *samples);
+    drop(samples);
+
+    let mut total = Vec::with_capacity(snapshot.len());
+    let mut format = Vec::with_capacity(snapshot.len());
+    let mut block = Vec::with_capacity(snapshot.len());
+    let mut engine = Vec::with_capacity(snapshot.len());
+    for sample in snapshot {
+        total.push(sample.total_ns);
+        format.push(sample.format_ns);
+        block.push(sample.block_ns);
+        engine.push(sample.engine_write_ns);
+    }
+
+    Some(RustSyncStageStats {
+        samples: total.len(),
+        total: stage_stats(total.as_mut_slice()),
+        format: stage_stats(format.as_mut_slice()),
+        block: stage_stats(block.as_mut_slice()),
+        engine_write: stage_stats(engine.as_mut_slice()),
+    })
+}
 
 fn registry() -> &'static InstanceRegistry<RustBackend> {
     static REGISTRY: OnceLock<InstanceRegistry<RustBackend>> = OnceLock::new();
@@ -365,8 +516,12 @@ impl RustBackend {
         pid: i64,
         tid: i64,
         maintid: i64,
+        timestamp: SystemTime,
+        profile: Option<&mut SyncBuildStage>,
     ) -> Option<&'a [u8]> {
-        let now = Local::now();
+        let mut profile = profile;
+        let format_begin = profile.as_ref().map(|_| Instant::now());
+        let hour = local_hour_from_timestamp(timestamp);
         self.format_record_line_into(
             &mut scratch.line,
             level,
@@ -378,9 +533,13 @@ impl RustBackend {
             pid,
             tid,
             maintid,
-            std::time::SystemTime::now(),
+            timestamp,
         );
+        if let (Some(begin), Some(stage)) = (format_begin, profile.as_mut()) {
+            stage.format_ns = begin.elapsed().as_nanos() as u64;
+        }
 
+        let block_begin = profile.as_ref().map(|_| Instant::now());
         let compression_kind = match self.config.compress_mode {
             CompressMode::Zlib => CompressionKind::Zlib,
             CompressMode::Zstd => CompressionKind::Zstd,
@@ -388,8 +547,8 @@ impl RustBackend {
         let header = LogHeader {
             magic: select_magic(compression_kind, AppendMode::Sync, self.cipher.enabled()),
             seq: SeqGenerator::sync_seq(),
-            begin_hour: chrono::Timelike::hour(&now) as u8,
-            end_hour: chrono::Timelike::hour(&now) as u8,
+            begin_hour: hour,
+            end_hour: hour,
             len: u32::try_from(scratch.line.len()).ok()?,
             client_pubkey: if self.cipher.enabled() {
                 self.cipher.client_pubkey()
@@ -403,6 +562,9 @@ impl RustBackend {
         scratch.block.extend_from_slice(&header.encode());
         scratch.block.extend_from_slice(scratch.line.as_bytes());
         scratch.block.push(0);
+        if let (Some(begin), Some(stage)) = (block_begin, profile.as_mut()) {
+            stage.block_ns = begin.elapsed().as_nanos() as u64;
+        }
         Some(scratch.block.as_slice())
     }
 
@@ -502,14 +664,48 @@ impl RustBackend {
             return;
         }
 
-        with_hot_path_scratch(|scratch| {
-            let Some(block) = self.build_sync_block_into(
-                scratch, level, tag, file, func, line, msg, pid, tid, maintid,
-            ) else {
-                return;
-            };
-            let _ = self.engine.write_block(block, level == LogLevel::Fatal);
-        });
+        if sync_stage_profile_enabled() {
+            with_hot_path_scratch(|scratch| {
+                let total_begin = Instant::now();
+                let mut stage = SyncBuildStage::default();
+                let timestamp = SystemTime::now();
+                let Some(block) = self.build_sync_block_into(
+                    scratch,
+                    level,
+                    tag,
+                    file,
+                    func,
+                    line,
+                    msg,
+                    pid,
+                    tid,
+                    maintid,
+                    timestamp,
+                    Some(&mut stage),
+                ) else {
+                    return;
+                };
+                let engine_begin = Instant::now();
+                let _ = self.engine.write_block(block, level == LogLevel::Fatal);
+                let engine_write_ns = engine_begin.elapsed().as_nanos() as u64;
+                record_sync_stage_sample(SyncStageSample {
+                    total_ns: total_begin.elapsed().as_nanos() as u64,
+                    format_ns: stage.format_ns,
+                    block_ns: stage.block_ns,
+                    engine_write_ns,
+                });
+            });
+        } else {
+            with_hot_path_scratch(|scratch| {
+                let timestamp = SystemTime::now();
+                let Some(block) = self.build_sync_block_into(
+                    scratch, level, tag, file, func, line, msg, pid, tid, maintid, timestamp, None,
+                ) else {
+                    return;
+                };
+                let _ = self.engine.write_block(block, level == LogLevel::Fatal);
+            });
+        }
     }
 
     fn new_async_pending_state(&self, hour: u8, flush_epoch: u64) -> Option<AsyncPendingState> {
@@ -1138,6 +1334,8 @@ mod tests {
                     std::process::id() as i64,
                     super::current_tid(),
                     super::main_tid(),
+                    std::time::SystemTime::now(),
+                    None,
                 )
                 .unwrap()
                 .to_vec()
@@ -1174,6 +1372,8 @@ mod tests {
                     std::process::id() as i64,
                     super::current_tid(),
                     super::main_tid(),
+                    std::time::SystemTime::now(),
+                    None,
                 )
                 .unwrap()
                 .to_vec()

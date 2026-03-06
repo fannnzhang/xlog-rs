@@ -112,12 +112,14 @@ benchmark 的角色应拆成两层：
 2. 基线可信度增强
    - `--warmup`
    - `--time-buckets`
+   - `--stage-profile`（Rust sync 子阶段采样）
    - `--json-pretty`
 3. 输出指标增强
    - throughput
    - `lat_min / avg / stdev / p50 / p95 / p99 / p999 / max`
    - `output_bytes`
    - `bytes_per_msg`
+   - `sync_stage_profile`（`total / format / block / engine_write`）
    - timeline bucket
 
 ### 3.2 微基准入口

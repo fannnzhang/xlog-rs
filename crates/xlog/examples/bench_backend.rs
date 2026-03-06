@@ -5,7 +5,10 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::Instant;
 
-use mars_xlog::{AppenderMode, CompressMode, LogLevel, Xlog, XlogConfig};
+use mars_xlog::{
+    set_rust_sync_stage_profile_enabled, take_rust_sync_stage_stats, AppenderMode, CompressMode,
+    LogLevel, RustSyncStageStats, StageLatencyStats, Xlog, XlogConfig,
+};
 
 const USAGE: &str = "\
 Benchmark xlog backend write throughput and latency.
@@ -31,6 +34,7 @@ Options:
   --max-file-size <n>      Max logfile size in bytes (default: 0 = disabled)
   --pub-key <hex>          Optional 128-char public key to enable crypto
   --time-buckets <n>       Number of timeline buckets to emit (default: 0 = disabled)
+  --stage-profile          Enable Rust sync stage profiling (format/block/engine-write)
   --json-pretty            Pretty-print JSON result
 ";
 
@@ -72,6 +76,7 @@ struct Options {
     max_file_size: i64,
     pub_key: Option<String>,
     time_buckets: usize,
+    stage_profile: bool,
     json_pretty: bool,
 }
 
@@ -150,6 +155,7 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let opts = parse_args()?;
+    set_rust_sync_stage_profile_enabled(opts.stage_profile);
     fs::create_dir_all(&opts.out_dir)
         .map_err(|e| format!("create out dir failed {}: {e}", opts.out_dir.display()))?;
     if let Some(cache_dir) = &opts.cache_dir {
@@ -297,6 +303,8 @@ fn run() -> Result<(), String> {
 
     logger.flush(true);
     drop(logger);
+    let sync_stage_profile = take_rust_sync_stage_stats();
+    set_rust_sync_stage_profile_enabled(false);
     let total_elapsed = start.elapsed();
     let output_bytes_end = output_bytes(&opts.out_dir, opts.cache_dir.as_deref());
 
@@ -388,6 +396,15 @@ fn run() -> Result<(), String> {
     } else {
         append_json_array_empty(&mut json, "timeline_buckets");
     }
+    if let Some(stats) = sync_stage_profile.as_ref() {
+        if !json.ends_with('{') {
+            json.push(',');
+        }
+        json.push_str("\"sync_stage_profile\":");
+        json.push_str(&sync_stage_profile_json(stats));
+    } else {
+        append_json_null(&mut json, "sync_stage_profile");
+    }
     json.push('}');
 
     if opts.json_pretty {
@@ -443,6 +460,7 @@ fn parse_args() -> Result<Options, String> {
     let mut max_file_size = 0i64;
     let mut pub_key: Option<String> = None;
     let mut time_buckets = 0usize;
+    let mut stage_profile = false;
     let mut json_pretty = false;
 
     let mut iter = env::args().skip(1);
@@ -574,6 +592,7 @@ fn parse_args() -> Result<Options, String> {
                     .parse::<usize>()
                     .map_err(|e| format!("invalid --time-buckets value {v}: {e}"))?;
             }
+            "--stage-profile" => stage_profile = true,
             "--json-pretty" => json_pretty = true,
             unknown => return Err(format!("unknown argument: {unknown}\n\n{USAGE}")),
         }
@@ -617,6 +636,7 @@ fn parse_args() -> Result<Options, String> {
         max_file_size,
         pub_key,
         time_buckets,
+        stage_profile,
         json_pretty,
     })
 }
@@ -866,6 +886,40 @@ fn append_json_array_empty(json: &mut String, key: &str) {
     json.push('"');
     json.push_str(key);
     json.push_str("\":[]");
+}
+
+fn stage_latency_json(stage: &StageLatencyStats) -> String {
+    let mut json = String::new();
+    json.push('{');
+    append_json_num(&mut json, "avg_ns", stage.avg_ns, 3);
+    append_json_num(&mut json, "p50_ns", stage.p50_ns as f64, 0);
+    append_json_num(&mut json, "p95_ns", stage.p95_ns as f64, 0);
+    append_json_num(&mut json, "p99_ns", stage.p99_ns as f64, 0);
+    append_json_num(&mut json, "max_ns", stage.max_ns as f64, 0);
+    json.push('}');
+    json
+}
+
+fn sync_stage_profile_json(stats: &RustSyncStageStats) -> String {
+    let mut json = String::new();
+    json.push('{');
+    append_json_num(&mut json, "samples", stats.samples as f64, 0);
+    if !json.ends_with('{') {
+        json.push(',');
+    }
+    json.push_str("\"total\":");
+    json.push_str(&stage_latency_json(&stats.total));
+    json.push(',');
+    json.push_str("\"format\":");
+    json.push_str(&stage_latency_json(&stats.format));
+    json.push(',');
+    json.push_str("\"block\":");
+    json.push_str(&stage_latency_json(&stats.block));
+    json.push(',');
+    json.push_str("\"engine_write\":");
+    json.push_str(&stage_latency_json(&stats.engine_write));
+    json.push('}');
+    json
 }
 
 fn pretty_json(input: &str) -> String {

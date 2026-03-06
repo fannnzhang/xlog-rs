@@ -16,10 +16,10 @@ compile_error!("xlog requires either `rust-backend` or `cpp-backend`");
 ))]
 use crate::ConsoleFun;
 
-#[cfg(feature = "rust-backend")]
-mod rust;
 #[cfg(feature = "cpp-backend")]
 mod cpp;
+#[cfg(feature = "rust-backend")]
+mod rust;
 
 pub(crate) trait XlogBackend: Send + Sync {
     fn instance(&self) -> usize;
@@ -94,4 +94,22 @@ pub(crate) fn provider() -> &'static dyn XlogBackendProvider {
     {
         return cpp::provider();
     }
+}
+
+#[cfg(feature = "rust-backend")]
+pub(crate) fn set_rust_sync_stage_profile_enabled(enabled: bool) {
+    rust::set_sync_stage_profile_enabled(enabled);
+}
+
+#[cfg(not(feature = "rust-backend"))]
+pub(crate) fn set_rust_sync_stage_profile_enabled(_enabled: bool) {}
+
+#[cfg(feature = "rust-backend")]
+pub(crate) fn take_rust_sync_stage_stats() -> Option<crate::RustSyncStageStats> {
+    rust::take_sync_stage_stats()
+}
+
+#[cfg(not(feature = "rust-backend"))]
+pub(crate) fn take_rust_sync_stage_stats() -> Option<crate::RustSyncStageStats> {
+    None
 }
