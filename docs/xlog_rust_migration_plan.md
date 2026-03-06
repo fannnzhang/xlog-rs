@@ -581,23 +581,48 @@ P0/P1 执行后差距（同上口径）：
 - sync：Rust 吞吐约为 C++ 的 10.3%，平均延迟约 10.97x，p99 约 2.68x。
 - 相比基线：Rust async 吞吐约提升 45.2%，Rust sync 吞吐约提升 60.9%。
 
-已识别的关键实现差异（需优先优化）：
+P2/P3 执行后快照（2026-03-06，`artifacts/bench-compare/20260306-perf5`，本地 macOS，release，`messages=20000`，`compress=zlib`，`msg-size=96`，3 轮均值）：
 
-1. async 写路径每条日志都会重写整段 pending bytes 到 mmap（`pending_bytes_without_tailer + replace_bytes_with_flush`）。
-2. sync 写路径每次 `write_block` 都执行 housekeeping（目录扫描/迁移/过期清理）。
-3. `append_bytes` 每次写入后都执行 `file.flush()`，与 C++ 当前写入策略存在明显差异。
-4. Rust 路径存在更多中间分配/拷贝（`String`/`Vec<u8>` 构造与转换）。
+说明：当前 `crates/xlog/src/backend/mod.rs` 仅接入 `rust-backend`，本轮未直接重跑 C++ backend benchmark；下表中的 C++ 数据继续沿用 `20260305-p0p1` 保留基线，用于衡量 Rust 对齐进度。
+
+| mode | backend | throughput_mps | lat_avg_ns | lat_p99_ns |
+| :--- | :--- | ---: | ---: | ---: |
+| async | Rust | 143,674.91 | 6,813.59 | 46,444.67 |
+| async | C++ | 333,156.55 | 2,845.75 | 6,625.00 |
+| sync | Rust | 170,180.00 | 5,728.23 | 23,861.33 |
+| sync | C++ | 487,713.61 | 1,793.75 | 13,819.33 |
+
+P2/P3 执行后差距（Rust 对保留 C++ 基线）：
+
+- async：Rust 吞吐约为 C++ 的 43.1%，平均延迟约 2.39x，p99 约 7.01x。
+- sync：Rust 吞吐约为 C++ 的 34.9%，平均延迟约 3.19x，p99 约 1.73x。
+- 相比 `20260305-main`：Rust async 吞吐约提升 51.1%，Rust sync 吞吐约提升 443.9%。
+- 相比 `20260305-p0p1`：Rust async 吞吐约提升 4.1%，Rust sync 吞吐约提升 238.1%。
+
+本轮已落地的 5 个结构性优化项：
+
+1. sync 文件写入改为复用活跃 logfile 句柄、路径与长度缓存，避免每条日志都重新 open/stat/path-select。
+2. async pending block 从“每条日志整段重建再 replace”改为 mmap 增量写入与尾部收敛。
+3. flush 路径与 housekeeping 解耦，目录迁移/过期扫描改为后台周期执行，不再阻塞 sync 热路径。
+4. mmap 热路径改为按语义等价点控制显式 flush 频率，避免每次增量更新都触发高成本同步。
+5. formatter/compress/encrypt 热路径引入可复用 scratch buffer，并将 async TEA 加密改为原位处理，减少中间 `String`/`Vec<u8>` 构造。
+
+当前剩余的关键实现差异（仍需继续优化）：
+
+1. async 路径虽然已转为增量持久化，但 p99 仍明显高于 C++，说明 mmap 持久化策略和压缩尾块收敛仍有抖动空间。
+2. sync 路径已显著改善，但整体仍只有 C++ 的约 34.9%，目录索引失效与文件轮转路径仍有额外系统调用。
+3. benchmark 对 C++ 的直接同轮重跑能力尚未恢复，需要补齐独立的 C++ backend bench harness，避免长期依赖保留基线。
 
 深度差异 Review（实现对比与优化方向）：
 
 | 维度 | 当前 Rust 路径 | 当前 C++ 路径 | 优化方向（不改逻辑） |
 | :--- | :--- | :--- | :--- |
-| async pending 持久化 | 每次写入生成完整 pending 再整体替换 mmap | 内存缓冲区按增量写入，达到阈值再 flush | 改为增量写入/增量更新 pending，避免 O(n) 级重复拷贝 |
-| sync 热路径 housekeeping | `write_block(sync)` 后立即执行 housekeep | 清理/搬迁由后台线程周期执行 | 拆分 housekeeping 到后台周期任务，写路径仅做必要 IO |
-| 文件 flush 频率 | append 后立即 `file.flush()` | `fwrite` 为主，未在每次写后强制 flush | 按语义等价点批量 flush，减少系统调用抖动 |
-| 内存分配与拷贝 | `String -> Vec<u8>`、中间 buffer 多次构造 | 栈缓冲 + 复用 buffer 为主 | 引入可复用 scratch buffer / 预分配容量 / 减少临时对象 |
-| 锁竞争 | async path 同时涉及 state mutex + engine state lock | 关键路径锁粒度较小 | 缩小锁作用域，拆分冷热状态锁，降低临界区长度 |
-| 文件索引/目录扫描 | 文件管理路径中目录扫描频次较高 | 目录维护更多依赖周期任务 | 增加运行时缓存与失效策略，减少重复目录遍历 |
+| async pending 持久化 | 已改为增量写入 mmap，但 finalize/recover 仍需收敛尾块 | 内存缓冲区按增量写入，达到阈值再 flush | 继续压缩 finalize 阶段拷贝与 pending recover 成本 |
+| sync 热路径 housekeeping | 已从 `flush(sync)` 解耦到后台周期任务 | 清理/搬迁由后台线程周期执行 | 保持当前策略，并继续核对周期粒度与触发点 |
+| sync 文件生命周期 | 已缓存活跃文件句柄、路径和长度，但 rotate 失效路径仍会触发额外扫描 | `logfile_` 长期持有，仅在轮转时重开 | 继续减少轮转边界上的 metadata/path 探测 |
+| mmap flush 频率 | 已支持按语义等价点延迟 flush，但 crash/recover 还需补充验证 | 未在每次增量写后做等价强制 flush | 在不改变恢复语义前提下继续降低热路径 flush 密度 |
+| 内存分配与拷贝 | formatter/compress/crypto 已复用 scratch，但 async finalize 仍有局部临时 buffer | 栈缓冲 + 复用 buffer 为主 | 继续把 finalize/oneshot 路径改为单向 borrowed bytes |
+| 锁竞争 | async path 已缩短锁持有，但 engine state 与状态机仍有串行点 | 关键路径锁粒度较小 | 继续拆分冷热状态锁，降低队列与 flush 串扰 |
 
 性能优化约束（必须遵守）：
 
@@ -606,17 +631,20 @@ P0/P1 执行后差距（同上口径）：
 3. 不修改对外 API 行为：JNI/UniFFI/NAPI 与 `mars-xlog` 公开语义保持一致。
 4. 优化只能发生在实现细节：生命周期管理、内存布局、拷贝路径、锁粒度、缓冲复用。
 
-任务拆分（P0/P1/P2）：
+任务拆分（P0/P1/P2/P3/P4）：
 
-| 优先级 | 任务项 | 状态（2026-03-05） | 代码位置 | 验收与产物 |
+| 优先级 | 任务项 | 状态（2026-03-06） | 代码位置 | 验收与产物 |
 | :--- | :--- | :--- | :--- | :--- |
 | P0 | sync 热路径移除每次写入 housekeeping | 已完成 | `crates/xlog-core/src/appender_engine.rs` | `cargo check -p mars-xlog-core -p mars-xlog` 通过；见 `20260305-p0p1` |
 | P0 | 热路径移除每次 `append_bytes` 后 `file.flush()` | 已完成 | `crates/xlog-core/src/file_manager.rs` | 同上；同步吞吐显著改善 |
 | P1 | async 路径 capacity 读取去锁/缩短锁持有 | 已完成 | `crates/xlog/src/backend/rust.rs`、`crates/xlog-core/src/appender_engine.rs` | 同上；异步路径锁竞争下降 |
 | P1 | `replace_bytes_with_flush` 减少无效零填充 | 已完成 | `crates/xlog-core/src/buffer.rs` | 同上；减少 mmap 写放大 |
-| P2 | pending bytes 从“全量重写”改为“增量更新” | 待执行 | `crates/xlog/src/backend/rust.rs`、`crates/xlog-core/src/buffer.rs` | 目标：进一步降低 async O(n) 拷贝与 p99 |
-| P2 | 引入复用 scratch buffer，减少中间 `Vec/String` 构造 | 待执行 | `crates/xlog/src/backend/rust.rs`、`crates/xlog-core/src/encoder.rs` | 目标：降低分配抖动与 CPU cache miss |
-| P2 | 拆分冷热锁 + 文件索引缓存，减少目录扫描 | 待执行 | `crates/xlog-core/src/appender_engine.rs`、`crates/xlog-core/src/file_manager.rs` | 目标：进一步缩短临界区并降低 syscalls |
+| P2 | pending bytes 从“全量重写”改为“增量更新” | 已完成 | `crates/xlog/src/backend/rust.rs`、`crates/xlog-core/src/buffer.rs`、`crates/xlog-core/src/appender_engine.rs` | `cargo test -p mars-xlog-core async_engine:: -- --nocapture` 通过；见 `20260306-perf5` |
+| P2 | sync 文件句柄/路径/长度缓存，减少 open/stat/path-select | 已完成 | `crates/xlog-core/src/file_manager.rs`、`crates/xlog-core/src/oneshot.rs` | `cargo test -p mars-xlog-core file_manager:: -- --nocapture` 通过；同步吞吐显著改善 |
+| P3 | flush 与 housekeeping 解耦，热路径降低 mmap 显式 flush 频率 | 已完成 | `crates/xlog-core/src/appender_engine.rs`、`crates/xlog-core/src/buffer.rs` | `cargo test -p mars-xlog --lib -- --nocapture` 通过；见 `20260306-perf5` |
+| P3 | 引入复用 scratch buffer 与原位 async crypto | 已完成 | `crates/xlog/src/backend/rust.rs`、`crates/xlog-core/src/formatter.rs`、`crates/xlog-core/src/crypto.rs` | 同上；减少中间 `String/Vec<u8>` 与热路径分配 |
+| P4 | 补齐独立 C++ backend benchmark harness，恢复同轮 Rust/C++ 对照 | 待执行 | `crates/xlog/examples/bench_backend.rs`、`scripts/xlog/*`、`crates/xlog-sys/*` | 目标：不依赖历史产物，直接产出同参数 A/B 数据 |
+| P4 | 在不改恢复语义前提下继续压缩 async p99 与轮转 syscalls | 待执行 | `crates/xlog-core/src/appender_engine.rs`、`crates/xlog-core/src/file_manager.rs`、`crates/xlog/src/backend/rust.rs` | 目标：对齐 C++ 90% 吞吐门槛并降低长尾 |
 
 Rust 特性驱动的实现层优化（不改逻辑）：
 
