@@ -1,0 +1,42 @@
+# Comprehensive benchmark matrix for Rust vs C++ xlog performance comparison.
+# Columns: scenario	messages	mode	threads	compress	compress_level	msg_size	flush_every	cache_days	max_file_size	pub_key	warmup	time_buckets
+#
+# ─── Async: thread scaling ───────────────────────────────────────────────
+async_1t	100000	async	1	zlib	6	96	0	0	0		1000	20
+async_2t	100000	async	2	zlib	6	96	0	0	0		1000	20
+async_4t	100000	async	4	zlib	6	96	0	0	0		1000	20
+async_8t	100000	async	8	zlib	6	96	0	0	0		1000	20
+#
+# ─── Async: message size sweep ───────────────────────────────────────────
+async_1t_small	100000	async	1	zlib	6	16	0	0	0		1000	0
+async_1t_medium	100000	async	1	zlib	6	512	0	0	0		1000	0
+async_1t_large	50000	async	1	zlib	6	4096	0	0	0		500	0
+#
+# ─── Async: compression comparison ──────────────────────────────────────
+async_1t_zstd	100000	async	1	zstd	3	96	0	0	0		1000	0
+async_4t_zstd	100000	async	4	zstd	3	96	0	0	0		1000	0
+async_1t_zlib9	100000	async	1	zlib	9	96	0	0	0		1000	0
+#
+# ─── Async: flush cadence sweep ─────────────────────────────────────────
+async_4t_flush64	100000	async	4	zlib	6	96	64	0	0		1000	20
+async_4t_flush256	100000	async	4	zlib	6	96	256	0	0		1000	20
+async_4t_flush1024	100000	async	4	zlib	6	96	1024	0	0		1000	20
+#
+# ─── Async: encryption ──────────────────────────────────────────────────
+async_1t_crypt	100000	async	1	zlib	6	96	0	0	0	79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8	1000	0
+async_4t_crypt	100000	async	4	zlib	6	96	0	0	0	79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8	1000	0
+#
+# ─── Sync: thread scaling ───────────────────────────────────────────────
+sync_1t	50000	sync	1	zlib	6	96	0	0	0		1000	20
+sync_2t	50000	sync	2	zlib	6	96	0	0	0		1000	20
+sync_4t	80000	sync	4	zlib	6	96	0	0	0		1000	20
+sync_8t	80000	sync	8	zlib	6	96	0	0	0		1000	20
+#
+# ─── Sync: message size sweep ───────────────────────────────────────────
+sync_1t_small	50000	sync	1	zlib	6	16	0	0	0		1000	0
+sync_1t_large	20000	sync	1	zlib	6	4096	0	0	0		500	0
+#
+# ─── Sync: file rotation + cache ────────────────────────────────────────
+sync_4t_rotate	80000	sync	4	zlib	6	96	0	0	4096		1000	0
+sync_4t_cache	80000	sync	4	zlib	6	96	0	1	0		1000	0
+sync_4t_boundary	80000	sync	4	zlib	6	96	0	1	4096		1000	0

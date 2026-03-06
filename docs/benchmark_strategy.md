@@ -101,7 +101,15 @@ benchmark 的角色应拆成两层：
 1. `manifest.tsv`
 2. `results_raw.jsonl`
 3. `summary.md`
-4. `run.log`
+4. `summary.json`
+5. `metadata.json`
+6. `run.log`
+
+当前 runner 已补上的可信度治理包括：
+
+1. Rust / C++ backend 顺序按 scenario 和 run 交替执行，避免固定 `rust -> cpp`
+2. `results_raw.jsonl` 记录 `scenario / backend / run_index / run_dir`
+3. `metadata.json` 记录时间、主机、CPU、git commit、branch、build profile、manifest、backend policy
 
 ## 4. 当前仍然存在的缺口
 
@@ -109,16 +117,15 @@ benchmark 的角色应拆成两层：
 
 ### 4.1 可信基线仍有缺口
 
-1. backend 执行顺序仍按 manifest 和 `--backends` 顺序跑，未做随机化或交替
-2. 当前还没有单独的环境元信息文件
-   - 主机
-   - CPU 核数
-   - git commit
-   - build profile
-   - 运行时间
-3. 结果目录虽然已有 `manifest/raw/summary/log`，但还缺少稳定的 `metadata` 约定
+1. 当前 backend 顺序治理只做到交替执行，还没有做真正随机化或更严格的冷热隔离
+2. `metadata.json` 已落地，但环境信息还不够完整
+   - CPU 型号
+   - 内存规模
+   - governor / 频率策略
+   - 操作系统版本细项
+3. 结果目录已有 `manifest/raw/summary/metadata/log`，但跨运行对比模板和稳定命名约定还需要继续固化
 
-这意味着结果已经比旧脚本可复现得多，但环境偏差治理还不够强。
+这意味着结果已经比旧脚本可信得多，但环境偏差治理还没有完全收口。
 
 ### 4.2 数据分布仍偏合成
 
@@ -165,9 +172,9 @@ benchmark 后续按以下顺序推进。
 
 优先处理：
 
-1. backend 顺序随机化或交替执行
+1. 在现有交替执行基础上评估是否需要随机化和额外 warmup 隔离
 2. 固化 warmup / runs / messages 的统一口径
-3. 为每次运行补 `metadata` 文件
+3. 继续扩展 `metadata` 字段
 4. 明确结果目录命名与归档约定
 
 目标不是继续加更多 case，而是先让现有结果更可信、更可复现。
@@ -218,7 +225,7 @@ benchmark 后续按以下顺序推进。
 2. `scripts/xlog/bench_matrix.tsv`
    - 管当前实际端到端矩阵清单
 3. `scripts/xlog/run_bench_matrix.sh`
-   - 管当前统一 runner
+   - 管当前统一 runner、backend 交替执行、metadata / summary 产物
 4. `crates/xlog/examples/bench_backend.rs`
    - 管端到端 benchmark 入口
 5. `crates/xlog-core/examples/bench_components.rs`
@@ -229,7 +236,7 @@ benchmark 后续按以下顺序推进。
 benchmark 体系达到“可信基线 + 基本可归因”至少需要满足：
 
 1. 端到端 runner 具备 manifest、metadata、raw、summary 的稳定输出
-2. backend 顺序偏差得到治理
+2. backend 顺序偏差得到治理，至少不能固定为单向顺序
 3. payload profile 不再只有规则化合成文本
 4. baseline / stress / feature 三类矩阵边界清晰
 5. 关键热点已有对应微基准，而不是只靠端到端吞吐猜测
