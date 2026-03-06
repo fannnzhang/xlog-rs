@@ -18,7 +18,9 @@ use crate::protocol::{
 };
 
 const DEFAULT_ASYNC_FLUSH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-const ASYNC_PENDING_MMAP_PERSIST_EVERY_UPDATES: u32 = 8;
+const ASYNC_PENDING_MMAP_PERSIST_EVERY_UPDATES: u32 = 32;
+const ASYNC_PENDING_MMAP_PERSIST_EVERY_BYTES: usize = 32 * 1024;
+const ASYNC_PENDING_MMAP_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
 const MIN_LOG_ALIVE_SECONDS: i64 = 24 * 60 * 60;
 const EXPIRED_SWEEP_INTERVAL: Duration = Duration::from_secs(2 * 60);
 const CACHE_MOVE_INTERVAL: Duration = Duration::from_secs(3 * 60);
@@ -47,7 +49,9 @@ struct EngineState {
     max_file_size: u64,
     max_alive_time: i64,
     async_pending_updates_since_persist: u32,
+    async_pending_bytes_since_persist: usize,
     last_async_buffer_mutation_at: Instant,
+    last_async_buffer_persist_at: Instant,
     last_expired_sweep_at: Instant,
     last_cache_move_at: Instant,
 }
@@ -106,7 +110,9 @@ impl AppenderEngine {
             max_file_size,
             max_alive_time: max_alive_time.max(MIN_LOG_ALIVE_SECONDS),
             async_pending_updates_since_persist: 0,
+            async_pending_bytes_since_persist: 0,
             last_async_buffer_mutation_at: now,
+            last_async_buffer_persist_at: now,
             last_expired_sweep_at: now,
             last_cache_move_at: now,
         }));
@@ -226,12 +232,13 @@ impl AppenderEngine {
                     let mut state = self.state.lock().expect("state lock poisoned");
                     state.async_pending_updates_since_persist =
                         state.async_pending_updates_since_persist.saturating_add(1);
-                    let should_persist_mmap = force_flush
-                        || state.async_pending_updates_since_persist
-                            >= ASYNC_PENDING_MMAP_PERSIST_EVERY_UPDATES;
+                    state.async_pending_bytes_since_persist = state
+                        .async_pending_bytes_since_persist
+                        .saturating_add(block.len());
+                    let should_persist_mmap = should_persist_async_mmap(&state, force_flush);
                     let appended = state.buffer.append_block_with_flush(block, should_persist_mmap)?;
                     if should_persist_mmap {
-                        state.async_pending_updates_since_persist = 0;
+                        mark_async_mmap_persisted(&mut state);
                     }
                     state.last_async_buffer_mutation_at = Instant::now();
 
@@ -268,13 +275,15 @@ impl AppenderEngine {
         let mut state = self.state.lock().expect("state lock poisoned");
         state.async_pending_updates_since_persist =
             state.async_pending_updates_since_persist.saturating_add(1);
-        let should_persist_mmap =
-            state.async_pending_updates_since_persist >= ASYNC_PENDING_MMAP_PERSIST_EVERY_UPDATES;
+        state.async_pending_bytes_since_persist = state
+            .async_pending_bytes_since_persist
+            .saturating_add(HEADER_LEN);
+        let should_persist_mmap = should_persist_async_mmap(&state, false);
         state
             .buffer
             .begin_pending_block_with_flush(header, should_persist_mmap)?;
         if should_persist_mmap {
-            state.async_pending_updates_since_persist = 0;
+            mark_async_mmap_persisted(&mut state);
         }
         state.last_async_buffer_mutation_at = Instant::now();
         Ok(())
@@ -302,14 +311,16 @@ impl AppenderEngine {
 
             state.async_pending_updates_since_persist =
                 state.async_pending_updates_since_persist.saturating_add(1);
-            let should_persist_mmap = should_flush
-                || state.async_pending_updates_since_persist
-                    >= ASYNC_PENDING_MMAP_PERSIST_EVERY_UPDATES;
+            let bytes_delta = chunk.len().saturating_sub(truncate_bytes);
+            state.async_pending_bytes_since_persist = state
+                .async_pending_bytes_since_persist
+                .saturating_add(bytes_delta);
+            let should_persist_mmap = should_persist_async_mmap(&state, force_flush);
             state
                 .buffer
                 .append_to_pending_with_flush(truncate_bytes, chunk, end_hour, should_persist_mmap)?;
             if should_persist_mmap {
-                state.async_pending_updates_since_persist = 0;
+                mark_async_mmap_persisted(&mut state);
             }
             state.last_async_buffer_mutation_at = Instant::now();
             should_flush
@@ -331,10 +342,18 @@ impl AppenderEngine {
         }
         {
             let mut state = self.state.lock().expect("state lock poisoned");
+            state.async_pending_updates_since_persist =
+                state.async_pending_updates_since_persist.saturating_add(1);
+            state.async_pending_bytes_since_persist = state
+                .async_pending_bytes_since_persist
+                .saturating_add(1);
+            let should_persist_mmap = should_persist_async_mmap(&state, force_flush);
             state
                 .buffer
-                .finalize_pending_block_with_flush(end_hour, true)?;
-            state.async_pending_updates_since_persist = 0;
+                .finalize_pending_block_with_flush(end_hour, should_persist_mmap)?;
+            if should_persist_mmap {
+                mark_async_mmap_persisted(&mut state);
+            }
             state.last_async_buffer_mutation_at = Instant::now();
         }
         if force_flush {
@@ -386,14 +405,15 @@ impl AppenderEngine {
 
             state.async_pending_updates_since_persist =
                 state.async_pending_updates_since_persist.saturating_add(1);
-            let should_persist_mmap = should_flush
-                || state.async_pending_updates_since_persist
-                    >= ASYNC_PENDING_MMAP_PERSIST_EVERY_UPDATES;
+            state.async_pending_bytes_since_persist = state
+                .async_pending_bytes_since_persist
+                .saturating_add(pending_bytes.len());
+            let should_persist_mmap = should_persist_async_mmap(&state, force_flush);
             state
                 .buffer
                 .replace_bytes_with_flush(pending_bytes, should_persist_mmap)?;
             if should_persist_mmap {
-                state.async_pending_updates_since_persist = 0;
+                mark_async_mmap_persisted(&mut state);
             }
             state.last_async_buffer_mutation_at = Instant::now();
             should_flush
@@ -518,7 +538,7 @@ fn flush_pending_locked(
     move_file: bool,
     write_startup_mmap_tips: bool,
 ) -> Result<bool, AppenderEngineError> {
-    state.async_pending_updates_since_persist = 0;
+    mark_async_mmap_persisted(state);
     let mut flushed = false;
     if !state.buffer.is_empty() {
         let scan = state.buffer.recovery_scan();
@@ -577,6 +597,19 @@ fn flush_pending_locked(
         flushed = true;
     }
     Ok(flushed)
+}
+
+fn should_persist_async_mmap(state: &EngineState, force_flush: bool) -> bool {
+    force_flush
+        || state.async_pending_updates_since_persist >= ASYNC_PENDING_MMAP_PERSIST_EVERY_UPDATES
+        || state.async_pending_bytes_since_persist >= ASYNC_PENDING_MMAP_PERSIST_EVERY_BYTES
+        || state.last_async_buffer_persist_at.elapsed() >= ASYNC_PENDING_MMAP_PERSIST_INTERVAL
+}
+
+fn mark_async_mmap_persisted(state: &mut EngineState) {
+    state.async_pending_updates_since_persist = 0;
+    state.async_pending_bytes_since_persist = 0;
+    state.last_async_buffer_persist_at = Instant::now();
 }
 
 fn handle_timeout_locked(
