@@ -49,6 +49,15 @@ pub struct FileManager {
 struct RuntimeState {
     last_append_time: Option<i64>,
     last_append_path: Option<PathBuf>,
+    active_file: Option<ActiveAppendFile>,
+}
+
+#[derive(Debug)]
+struct ActiveAppendFile {
+    path: PathBuf,
+    day_key: i32,
+    len: u64,
+    file: File,
 }
 
 impl FileManager {
@@ -146,6 +155,7 @@ impl FileManager {
         bytes: &[u8],
         max_file_size: u64,
         move_file: bool,
+        keep_open: bool,
     ) -> Result<(), FileManagerError> {
         if bytes.is_empty() {
             return Ok(());
@@ -153,9 +163,12 @@ impl FileManager {
 
         if self.cache_dir.is_none() {
             let now = Local::now();
-            let path =
-                self.select_append_path(now, &self.log_dir, &self.name_prefix, max_file_size);
-            return append_bytes(&path, bytes);
+            let path = self
+                .active_append_path(now, &self.log_dir, keep_open)
+                .unwrap_or_else(|| {
+                    self.select_append_path(now, &self.log_dir, &self.name_prefix, max_file_size)
+                });
+            return self.append_bytes_with_runtime(&path, bytes, now, keep_open);
         }
 
         let cache_dir = self.cache_dir.as_ref().expect("cache_dir is_some");
@@ -164,7 +177,7 @@ impl FileManager {
         let cache_logs = self.should_cache_logs(now, max_file_size);
 
         if cache_logs || cache_path.exists() {
-            append_bytes(&cache_path, bytes)?;
+            self.append_bytes_with_runtime(&cache_path, bytes, now, keep_open)?;
             if cache_logs || !move_file {
                 return Ok(());
             }
@@ -179,9 +192,9 @@ impl FileManager {
 
         let log_path =
             self.select_append_path(now, &self.log_dir, &self.name_prefix, max_file_size);
-        match append_bytes(&log_path, bytes) {
+        match self.append_bytes_with_runtime(&log_path, bytes, now, keep_open) {
             Ok(()) => Ok(()),
-            Err(_) => append_bytes(&cache_path, bytes),
+            Err(_) => self.append_bytes_with_runtime(&cache_path, bytes, now, keep_open),
         }
     }
 
@@ -349,6 +362,95 @@ impl FileManager {
         self.make_path_for_time(now, dir, prefix, max_file_size)
     }
 
+    fn append_bytes_with_runtime(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        now: chrono::DateTime<Local>,
+        keep_open: bool,
+    ) -> Result<(), FileManagerError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| FileManagerError::CreateDir(parent.to_path_buf(), e))?;
+        }
+
+        let day_key = day_key(now);
+        let mut runtime = self.runtime.lock().expect("file_manager runtime lock poisoned");
+        let path_buf = path.to_path_buf();
+
+        let must_reopen = runtime
+            .active_file
+            .as_ref()
+            .map(|active| active.path != path_buf || active.day_key != day_key)
+            .unwrap_or(false);
+        if must_reopen {
+            runtime.active_file = None;
+        }
+        if runtime.active_file.is_none() {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| FileManagerError::OpenFile(path_buf.clone(), e))?;
+            let len = file
+                .metadata()
+                .map_err(|e| FileManagerError::Metadata(path_buf.clone(), e))?
+                .len();
+            runtime.active_file = Some(ActiveAppendFile {
+                path: path_buf.clone(),
+                day_key,
+                len,
+                file,
+            });
+        }
+
+        let result = {
+            let active = runtime.active_file.as_mut().expect("active file initialized");
+            let before_len = active.len;
+            match active.file.write_all(bytes) {
+                Ok(()) => {
+                    active.len = before_len.saturating_add(bytes.len() as u64);
+                    Ok(())
+                }
+                Err(e) => {
+                    rollback_file_to_len(&mut active.file, before_len);
+                    Err(FileManagerError::WriteFile(path_buf.clone(), e))
+                }
+            }
+        };
+
+        if !keep_open {
+            runtime.active_file = None;
+        }
+
+        result
+    }
+
+    fn active_append_path(
+        &self,
+        now: chrono::DateTime<Local>,
+        dir: &Path,
+        keep_open: bool,
+    ) -> Option<PathBuf> {
+        if !keep_open {
+            return None;
+        }
+        let mut runtime = self.runtime.lock().expect("file_manager runtime lock poisoned");
+        let active = runtime.active_file.as_ref()?;
+        let active_day_key = active.day_key;
+        let active_parent = active.path.parent().map(Path::to_path_buf);
+        let active_path = active.path.clone();
+        if active_day_key != day_key(now) {
+            return None;
+        }
+        if active_parent.as_deref() != Some(dir) {
+            return None;
+        }
+        runtime.last_append_time = Some(now.timestamp());
+        runtime.last_append_path = Some(active_path.clone());
+        Some(active_path)
+    }
+
     fn make_path_for_time(
         &self,
         now: chrono::DateTime<Local>,
@@ -454,25 +556,8 @@ fn make_date_prefix(prefix: &str, timespan: i32) -> String {
     )
 }
 
-fn append_bytes(path: &Path, bytes: &[u8]) -> Result<(), FileManagerError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| FileManagerError::CreateDir(parent.to_path_buf(), e))?;
-    }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| FileManagerError::OpenFile(path.to_path_buf(), e))?;
-    let before_len = file
-        .metadata()
-        .map_err(|e| FileManagerError::Metadata(path.to_path_buf(), e))?
-        .len();
-    if let Err(e) = file.write_all(bytes) {
-        rollback_file_to_len(&mut file, before_len);
-        return Err(FileManagerError::WriteFile(path.to_path_buf(), e));
-    }
-    Ok(())
+fn day_key(now: chrono::DateTime<Local>) -> i32 {
+    (now.year() as i32) * 10_000 + (now.month() as i32) * 100 + now.day() as i32
 }
 
 fn append_file_to_file(src: &Path, dst: &Path) -> Result<(), FileManagerError> {
@@ -527,11 +612,6 @@ fn append_file_to_file(src: &Path, dst: &Path) -> Result<(), FileManagerError> {
             std::io::Error::new(std::io::ErrorKind::WriteZero, "partial append"),
         ));
     }
-    if let Err(e) = dst_file.flush() {
-        rollback_file_to_len(&mut dst_file, dst_before_len);
-        return Err(FileManagerError::WriteFile(dst.to_path_buf(), e));
-    }
-
     Ok(())
 }
 
@@ -578,5 +658,41 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert!(paths[0].starts_with(log_dir.to_string_lossy().as_ref()));
         assert!(paths[1].starts_with(cache_dir.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn keep_open_reuses_same_sync_file_within_day() {
+        let root = tempfile::tempdir().unwrap();
+        let log_dir = root.path().join("log");
+        let manager = FileManager::new(log_dir.clone(), None, "demo".to_string(), 0).unwrap();
+
+        manager.append_log_bytes(b"aaaa", 1, false, true).unwrap();
+        manager.append_log_bytes(b"bbbb", 1, false, true).unwrap();
+
+        let entries = std::fs::read_dir(&log_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(std::ffi::OsStr::to_str) == Some("xlog"))
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(std::fs::read(&entries[0]).unwrap(), b"aaaabbbb");
+    }
+
+    #[test]
+    fn close_after_write_still_rotates_by_size() {
+        let root = tempfile::tempdir().unwrap();
+        let log_dir = root.path().join("log");
+        let manager = FileManager::new(log_dir.clone(), None, "demo".to_string(), 0).unwrap();
+
+        manager.append_log_bytes(b"aaaa", 1, false, false).unwrap();
+        manager.append_log_bytes(b"bbbb", 1, false, false).unwrap();
+
+        let mut entries = std::fs::read_dir(&log_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(std::ffi::OsStr::to_str) == Some("xlog"))
+            .collect::<Vec<_>>();
+        entries.sort();
+        assert_eq!(entries.len(), 2);
     }
 }

@@ -60,7 +60,7 @@ pub fn oneshot_flush(
         "~~~~~ begin of mmap from other process ~~~~~\n",
     ) {
         if file_manager
-            .append_log_bytes(&begin, max_file_size, false)
+            .append_log_bytes(&begin, max_file_size, false, false)
             .is_err()
         {
             return FileIoAction::WriteFailed;
@@ -68,7 +68,7 @@ pub fn oneshot_flush(
     }
 
     if file_manager
-        .append_log_bytes(&recovered.bytes, max_file_size, false)
+        .append_log_bytes(&recovered.bytes, max_file_size, false, false)
         .is_err()
     {
         return FileIoAction::WriteFailed;
@@ -79,7 +79,7 @@ pub fn oneshot_flush(
     );
     if let Some(end) = build_sync_tip_block(sample_header, &end_tip) {
         if file_manager
-            .append_log_bytes(&end, max_file_size, false)
+            .append_log_bytes(&end, max_file_size, false, false)
             .is_err()
         {
             return FileIoAction::WriteFailed;
