@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use chrono::Local;
 use mars_xlog_core::appender_engine::{AppenderEngine, EngineMode};
@@ -56,7 +56,8 @@ struct RustBackend {
     console_open: AtomicBool,
     cipher: EcdhTeaCipher,
     engine: AppenderEngine,
-    async_state: Mutex<Option<AsyncPendingState>>,
+    async_state: Mutex<AsyncStateSlot>,
+    async_state_ready: Condvar,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -92,6 +93,53 @@ struct AsyncPendingState {
     compressor: AsyncCompressor,
     crypt_tail: Vec<u8>,
     flush_epoch: u64,
+}
+
+struct AsyncStateSlot {
+    pending: Option<AsyncPendingState>,
+    busy: bool,
+}
+
+impl AsyncStateSlot {
+    fn empty() -> Self {
+        Self {
+            pending: None,
+            busy: false,
+        }
+    }
+}
+
+struct CheckedOutAsyncState<'a> {
+    backend: &'a RustBackend,
+    pending: Option<AsyncPendingState>,
+}
+
+impl CheckedOutAsyncState<'_> {
+    fn pending(&self) -> Option<&AsyncPendingState> {
+        self.pending.as_ref()
+    }
+
+    fn pending_mut(&mut self) -> Option<&mut AsyncPendingState> {
+        self.pending.as_mut()
+    }
+
+    fn set_pending(&mut self, pending: Option<AsyncPendingState>) {
+        self.pending = pending;
+    }
+}
+
+impl Drop for CheckedOutAsyncState<'_> {
+    fn drop(&mut self) {
+        let mut guard = self
+            .backend
+            .async_state
+            .lock()
+            .expect("async state lock poisoned");
+        debug_assert!(guard.busy);
+        guard.pending = self.pending.take();
+        guard.busy = false;
+        self.backend.async_state_ready.notify_one();
+    }
 }
 
 impl AsyncPendingState {
@@ -184,7 +232,8 @@ impl AsyncPendingState {
             return false;
         }
         self.crypt_tail.clear();
-        self.crypt_tail.extend_from_slice(&crypto_scratch[full_len..]);
+        self.crypt_tail
+            .extend_from_slice(&crypto_scratch[full_len..]);
         self.payload_len = next_payload_len;
         true
     }
@@ -282,8 +331,24 @@ impl RustBackend {
             config,
             cipher,
             engine,
-            async_state: Mutex::new(None),
+            async_state: Mutex::new(AsyncStateSlot::empty()),
+            async_state_ready: Condvar::new(),
         })
+    }
+
+    fn checkout_async_state(&self) -> CheckedOutAsyncState<'_> {
+        let mut guard = self.async_state.lock().expect("async state lock poisoned");
+        while guard.busy {
+            guard = self
+                .async_state_ready
+                .wait(guard)
+                .expect("async state lock poisoned");
+        }
+        guard.busy = true;
+        CheckedOutAsyncState {
+            backend: self,
+            pending: guard.pending.take(),
+        }
     }
 
     fn build_sync_block_into<'a>(
@@ -332,9 +397,7 @@ impl RustBackend {
         };
 
         scratch.block.clear();
-        scratch
-            .block
-            .reserve(HEADER_LEN + scratch.line.len() + 1);
+        scratch.block.reserve(HEADER_LEN + scratch.line.len() + 1);
         scratch.block.extend_from_slice(&header.encode());
         scratch.block.extend_from_slice(scratch.line.as_bytes());
         scratch.block.push(0);
@@ -439,16 +502,7 @@ impl RustBackend {
 
         with_hot_path_scratch(|scratch| {
             let Some(block) = self.build_sync_block_into(
-                scratch,
-                level,
-                tag,
-                file,
-                func,
-                line,
-                msg,
-                pid,
-                tid,
-                maintid,
+                scratch, level, tag, file, func, line, msg, pid, tid, maintid,
             ) else {
                 return;
             };
@@ -506,24 +560,38 @@ impl RustBackend {
         let capacity = self.engine.buffer_capacity();
 
         with_hot_path_scratch(|scratch| {
-            let mut state_guard = self.async_state.lock().expect("async state lock poisoned");
-            let stale = state_guard
-                .as_ref()
+            self.format_record_line_into(
+                &mut scratch.line,
+                level,
+                tag,
+                file,
+                func,
+                line,
+                msg,
+                pid,
+                tid,
+                maintid,
+                timestamp,
+            );
+
+            let mut checked_out = self.checkout_async_state();
+            let stale = checked_out
+                .pending()
                 .map(|s| s.flush_epoch != engine_epoch)
                 .unwrap_or(false);
             if stale {
-                *state_guard = None;
+                checked_out.set_pending(None);
             }
-            if state_guard.is_none() {
+            if checked_out.pending().is_none() {
                 let Some(new_state) = self.new_async_pending_state(now_hour, engine_epoch) else {
                     return;
                 };
                 if self.engine.begin_async_pending(&new_state.header).is_err() {
                     return;
                 }
-                *state_guard = Some(new_state);
+                checked_out.set_pending(Some(new_state));
             }
-            let Some(state) = state_guard.as_mut() else {
+            let Some(state) = checked_out.pending_mut() else {
                 return;
             };
 
@@ -535,20 +603,6 @@ impl RustBackend {
                 let _ = write!(
                     scratch.line,
                     "[F][ sg_buffer_async.Length() >= BUFFER_BLOCK_LENTH*4/5, len: {current_len}\n"
-                );
-            } else {
-                self.format_record_line_into(
-                    &mut scratch.line,
-                    level,
-                    tag,
-                    file,
-                    func,
-                    line,
-                    msg,
-                    pid,
-                    tid,
-                    maintid,
-                    timestamp,
                 );
             }
 
@@ -562,32 +616,34 @@ impl RustBackend {
                 now_hour,
                 level == LogLevel::Fatal,
             ) {
-                *state_guard = None;
+                checked_out.set_pending(None);
+                drop(checked_out);
                 let _ = self.engine.flush(true);
             }
         });
     }
 
     fn finalize_async_pending(&self) {
+        let now_hour = chrono::Timelike::hour(&Local::now()) as u8;
         with_hot_path_scratch(|scratch| {
-            let mut state_guard = self.async_state.lock().expect("async state lock poisoned");
-            let now_hour = chrono::Timelike::hour(&Local::now()) as u8;
-            let Some(state) = state_guard.as_mut() else {
+            let mut checked_out = self.checkout_async_state();
+            let Some(state) = checked_out.pending_mut() else {
                 return;
             };
-            if !state.finalize(
+            let finalized = state.finalize(
                 &mut scratch.compress,
                 &mut scratch.crypto,
                 &self.cipher,
                 &self.engine,
                 now_hour,
                 false,
-            ) {
-                if self.engine.mode() == EngineMode::Async {
-                    let _ = self.engine.flush(true);
-                }
+            );
+            checked_out.set_pending(None);
+            let needs_force_flush = !finalized && self.engine.mode() == EngineMode::Async;
+            drop(checked_out);
+            if needs_force_flush {
+                let _ = self.engine.flush(true);
             }
-            *state_guard = None;
         });
     }
 
@@ -1442,7 +1498,7 @@ mod tests {
             let mut state = backend.new_async_pending_state(1, engine_epoch).unwrap();
             backend.engine.begin_async_pending(&state.header).unwrap();
             state.payload_len = threshold.saturating_sub(HEADER_LEN);
-            *guard = Some(state);
+            guard.pending = Some(state);
         }
 
         backend.write_async_line(
