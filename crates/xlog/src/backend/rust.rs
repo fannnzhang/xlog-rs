@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use chrono::{Local, TimeZone};
+use chrono::TimeZone;
 use mars_xlog_core::appender_engine::{AppenderEngine, EngineMode};
 use mars_xlog_core::buffer::{PersistentBuffer, DEFAULT_BUFFER_BLOCK_LEN};
 use mars_xlog_core::compress::{StreamCompressor, ZlibStreamCompressor, ZstdStreamCompressor};
@@ -490,6 +490,15 @@ impl RustBackend {
     }
 
     fn checkout_async_state(&self) -> CheckedOutAsyncState<'_> {
+        if let Ok(mut guard) = self.async_state.try_lock() {
+            if !guard.busy {
+                guard.busy = true;
+                return CheckedOutAsyncState {
+                    backend: self,
+                    pending: guard.pending.take(),
+                };
+            }
+        }
         let mut guard = self.async_state.lock().expect("async state lock poisoned");
         while guard.busy {
             guard = self
@@ -753,9 +762,8 @@ impl RustBackend {
         tid: i64,
         maintid: i64,
     ) {
-        let now = Local::now();
-        let now_hour = chrono::Timelike::hour(&now) as u8;
         let timestamp = std::time::SystemTime::now();
+        let now_hour = local_hour_from_timestamp(timestamp);
         let engine_epoch = self.engine.async_flush_epoch();
         let capacity = self.engine.buffer_capacity();
 
@@ -824,7 +832,7 @@ impl RustBackend {
     }
 
     fn finalize_async_pending(&self) {
-        let now_hour = chrono::Timelike::hour(&Local::now()) as u8;
+        let now_hour = local_hour_from_timestamp(std::time::SystemTime::now());
         with_hot_path_scratch(|scratch| {
             let mut checked_out = self.checkout_async_state();
             let Some(state) = checked_out.pending_mut() else {
