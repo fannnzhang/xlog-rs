@@ -77,6 +77,7 @@ struct AsyncFrontend {
     flush_queued: Arc<AtomicBool>,
     line_pools: Arc<[ArrayQueue<String>]>,
     producer_shard_mask: AtomicU32,
+    full_retry_before_block: usize,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -396,6 +397,11 @@ impl SyncStageProfiler {
 struct AsyncStageProfiler {
     enabled: AtomicBool,
     samples: Mutex<Vec<AsyncStageSample>>,
+    queue_full_count: AtomicU64,
+    block_send_count: AtomicU64,
+    block_send_ns: AtomicU64,
+    queue_depth_current: AtomicUsize,
+    queue_depth_high_watermark: AtomicUsize,
 }
 
 impl AsyncStageProfiler {
@@ -403,6 +409,11 @@ impl AsyncStageProfiler {
         Self {
             enabled: AtomicBool::new(false),
             samples: Mutex::new(Vec::new()),
+            queue_full_count: AtomicU64::new(0),
+            block_send_count: AtomicU64::new(0),
+            block_send_ns: AtomicU64::new(0),
+            queue_depth_current: AtomicUsize::new(0),
+            queue_depth_high_watermark: AtomicUsize::new(0),
         }
     }
 }
@@ -417,7 +428,8 @@ static ASYNC_STAGE_PROFILER: OnceLock<AsyncStageProfiler> = OnceLock::new();
 const ASYNC_WARNING_THRESHOLD_NUM: usize = 4;
 const ASYNC_WARNING_THRESHOLD_DEN: usize = 5;
 const ASYNC_FRONTEND_QUEUE_CAPACITY: usize = 65536;
-const ASYNC_FRONTEND_FULL_RETRY_BEFORE_BLOCK: usize = 4;
+const ASYNC_FRONTEND_FULL_RETRY_BEFORE_BLOCK_DEFAULT: usize = 4;
+const ASYNC_FRONTEND_FULL_RETRY_BEFORE_BLOCK_ZSTD: usize = 1;
 const ASYNC_FRONTEND_WRITE_BATCH_MAX: usize = 128;
 const ASYNC_LINE_POOL_SHARDS: usize = 16;
 const ASYNC_LINE_POOL_MAX_BUFFERS_PER_SHARD: usize = 256;
@@ -445,6 +457,10 @@ impl AsyncFrontend {
         let (tx, rx) = sync_channel::<AsyncFrontendCommand>(ASYNC_FRONTEND_QUEUE_CAPACITY);
         let accepting = Arc::new(AtomicBool::new(true));
         let flush_queued = Arc::new(AtomicBool::new(false));
+        let full_retry_before_block = match config.compress_mode {
+            CompressMode::Zstd => ASYNC_FRONTEND_FULL_RETRY_BEFORE_BLOCK_ZSTD,
+            CompressMode::Zlib => ASYNC_FRONTEND_FULL_RETRY_BEFORE_BLOCK_DEFAULT,
+        };
         let line_pools = Arc::<[ArrayQueue<String>]>::from(
             (0..ASYNC_LINE_POOL_SHARDS)
                 .map(|_| ArrayQueue::new(ASYNC_LINE_POOL_MAX_BUFFERS_PER_SHARD))
@@ -472,6 +488,7 @@ impl AsyncFrontend {
             flush_queued,
             line_pools,
             producer_shard_mask: AtomicU32::new(0),
+            full_retry_before_block,
             worker: Mutex::new(Some(worker)),
         }
     }
@@ -487,18 +504,38 @@ impl AsyncFrontend {
                 front.enqueue_ns = begin.elapsed().as_nanos() as u64;
             }
             match self.tx.try_send(AsyncFrontendCommand::Write(cmd)) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    if enqueue_begin.is_some() {
+                        record_async_enqueued();
+                    }
+                    return Ok(());
+                }
                 Err(TrySendError::Disconnected(AsyncFrontendCommand::Write(v))) => return Err(v),
                 Err(TrySendError::Full(AsyncFrontendCommand::Write(v))) => {
+                    if enqueue_begin.is_some() {
+                        record_async_queue_full();
+                    }
                     cmd = v;
                     full_retries = full_retries.saturating_add(1);
-                    if full_retries >= ASYNC_FRONTEND_FULL_RETRY_BEFORE_BLOCK {
+                    if full_retries >= self.full_retry_before_block {
                         if !self.accepting.load(Ordering::Acquire) {
                             return Err(cmd);
                         }
+                        let block_begin = enqueue_begin.map(|_| Instant::now());
                         return match self.tx.send(AsyncFrontendCommand::Write(cmd)) {
-                            Ok(()) => Ok(()),
-                            Err(SendError(AsyncFrontendCommand::Write(v))) => Err(v),
+                            Ok(()) => {
+                                if let Some(begin) = block_begin {
+                                    record_async_block_send(begin.elapsed().as_nanos() as u64);
+                                    record_async_enqueued();
+                                }
+                                Ok(())
+                            }
+                            Err(SendError(AsyncFrontendCommand::Write(v))) => {
+                                if let Some(begin) = block_begin {
+                                    record_async_block_send(begin.elapsed().as_nanos() as u64);
+                                }
+                                Err(v)
+                            }
                             Err(_) => unreachable!("unexpected async frontend command variant"),
                         };
                     }
@@ -608,6 +645,9 @@ fn run_async_frontend_worker(
         match first {
             AsyncFrontendCommand::Write(cmd) => {
                 let mut cmd = cmd;
+                if cmd.profile.is_some() {
+                    record_async_dequeued();
+                }
                 handle_async_frontend_write(
                     &mut cmd,
                     &engine,
@@ -625,6 +665,9 @@ fn run_async_frontend_worker(
                     match rx.try_recv() {
                         Ok(AsyncFrontendCommand::Write(next)) => {
                             let mut next = next;
+                            if next.profile.is_some() {
+                                record_async_dequeued();
+                            }
                             handle_async_frontend_write(
                                 &mut next,
                                 &engine,
@@ -998,6 +1041,67 @@ fn record_async_stage_sample(sample: AsyncStageSample) {
     }
 }
 
+fn record_async_queue_full() {
+    let profiler = async_stage_profiler();
+    if !profiler.enabled.load(Ordering::Relaxed) {
+        return;
+    }
+    profiler.queue_full_count.fetch_add(1, Ordering::Relaxed);
+}
+
+fn record_async_block_send(block_ns: u64) {
+    let profiler = async_stage_profiler();
+    if !profiler.enabled.load(Ordering::Relaxed) {
+        return;
+    }
+    profiler.block_send_count.fetch_add(1, Ordering::Relaxed);
+    profiler.block_send_ns.fetch_add(block_ns, Ordering::Relaxed);
+}
+
+fn record_async_enqueued() {
+    let profiler = async_stage_profiler();
+    if !profiler.enabled.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let depth = profiler
+        .queue_depth_current
+        .fetch_add(1, Ordering::AcqRel)
+        .saturating_add(1);
+    let depth_for_high = depth.min(ASYNC_FRONTEND_QUEUE_CAPACITY);
+    let mut current_max = profiler.queue_depth_high_watermark.load(Ordering::Acquire);
+    while depth_for_high > current_max {
+        match profiler.queue_depth_high_watermark.compare_exchange_weak(
+            current_max,
+            depth_for_high,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(v) => current_max = v,
+        }
+    }
+}
+
+fn record_async_dequeued() {
+    let profiler = async_stage_profiler();
+    if !profiler.enabled.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut current = profiler.queue_depth_current.load(Ordering::Acquire);
+    while current > 0 {
+        match profiler.queue_depth_current.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(v) => current = v,
+        }
+    }
+}
+
 fn local_hour_from_timestamp(timestamp: SystemTime) -> u8 {
     if let Ok(since_epoch) = timestamp.duration_since(UNIX_EPOCH) {
         let epoch_secs = since_epoch.as_secs();
@@ -1091,6 +1195,13 @@ pub(super) fn set_async_stage_profile_enabled(enabled: bool) {
     if let Ok(mut samples) = profiler.samples.lock() {
         samples.clear();
     }
+    profiler.queue_full_count.store(0, Ordering::Relaxed);
+    profiler.block_send_count.store(0, Ordering::Relaxed);
+    profiler.block_send_ns.store(0, Ordering::Relaxed);
+    profiler.queue_depth_current.store(0, Ordering::Relaxed);
+    profiler
+        .queue_depth_high_watermark
+        .store(0, Ordering::Relaxed);
 }
 
 pub(super) fn take_async_stage_stats() -> Option<RustAsyncStageStats> {
@@ -1131,6 +1242,11 @@ pub(super) fn take_async_stage_stats() -> Option<RustAsyncStageStats> {
         begin_pending: stage_stats(begin_pending.as_mut_slice()),
         append: stage_stats(append.as_mut_slice()),
         force_flush: stage_stats(force_flush.as_mut_slice()),
+        queue_full_count: profiler.queue_full_count.load(Ordering::Relaxed),
+        block_send_count: profiler.block_send_count.load(Ordering::Relaxed),
+        block_send_ns: profiler.block_send_ns.load(Ordering::Relaxed),
+        queue_depth_high_watermark: profiler.queue_depth_high_watermark.load(Ordering::Relaxed)
+            as u64,
     })
 }
 

@@ -127,6 +127,10 @@ pub struct RustAsyncStageStats {
     pub begin_pending: StageLatencyStats,
     pub append: StageLatencyStats,
     pub force_flush: StageLatencyStats,
+    pub queue_full_count: u64,
+    pub block_send_count: u64,
+    pub block_send_ns: u64,
+    pub queue_depth_high_watermark: u64,
 }
 
 impl Default for RawLogMeta {

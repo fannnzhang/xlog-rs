@@ -939,6 +939,25 @@ fn async_stage_profile_json(stats: &RustAsyncStageStats) -> String {
     let mut json = String::new();
     json.push('{');
     append_json_num(&mut json, "samples", stats.samples as f64, 0);
+    append_json_num(
+        &mut json,
+        "queue_full_count",
+        stats.queue_full_count as f64,
+        0,
+    );
+    append_json_num(
+        &mut json,
+        "block_send_count",
+        stats.block_send_count as f64,
+        0,
+    );
+    append_json_num(&mut json, "block_send_ns", stats.block_send_ns as f64, 0);
+    append_json_num(
+        &mut json,
+        "queue_depth_high_watermark",
+        stats.queue_depth_high_watermark as f64,
+        0,
+    );
     if !json.ends_with('{') {
         json.push(',');
     }
