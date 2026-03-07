@@ -105,11 +105,29 @@ pub(crate) fn set_rust_sync_stage_profile_enabled(enabled: bool) {
 pub(crate) fn set_rust_sync_stage_profile_enabled(_enabled: bool) {}
 
 #[cfg(feature = "rust-backend")]
+pub(crate) fn set_rust_async_stage_profile_enabled(enabled: bool) {
+    rust::set_async_stage_profile_enabled(enabled);
+}
+
+#[cfg(not(feature = "rust-backend"))]
+pub(crate) fn set_rust_async_stage_profile_enabled(_enabled: bool) {}
+
+#[cfg(feature = "rust-backend")]
 pub(crate) fn take_rust_sync_stage_stats() -> Option<crate::RustSyncStageStats> {
     rust::take_sync_stage_stats()
 }
 
 #[cfg(not(feature = "rust-backend"))]
 pub(crate) fn take_rust_sync_stage_stats() -> Option<crate::RustSyncStageStats> {
+    None
+}
+
+#[cfg(feature = "rust-backend")]
+pub(crate) fn take_rust_async_stage_stats() -> Option<crate::RustAsyncStageStats> {
+    rust::take_async_stage_stats()
+}
+
+#[cfg(not(feature = "rust-backend"))]
+pub(crate) fn take_rust_async_stage_stats() -> Option<crate::RustAsyncStageStats> {
     None
 }

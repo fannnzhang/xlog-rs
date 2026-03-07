@@ -6,8 +6,9 @@ use std::thread;
 use std::time::Instant;
 
 use mars_xlog::{
-    set_rust_sync_stage_profile_enabled, take_rust_sync_stage_stats, AppenderMode, CompressMode,
-    LogLevel, RustSyncStageStats, StageLatencyStats, Xlog, XlogConfig,
+    set_rust_async_stage_profile_enabled, set_rust_sync_stage_profile_enabled,
+    take_rust_async_stage_stats, take_rust_sync_stage_stats, AppenderMode, CompressMode, LogLevel,
+    RustAsyncStageStats, RustSyncStageStats, StageLatencyStats, Xlog, XlogConfig,
 };
 
 const USAGE: &str = "\
@@ -34,7 +35,7 @@ Options:
   --max-file-size <n>      Max logfile size in bytes (default: 0 = disabled)
   --pub-key <hex>          Optional 128-char public key to enable crypto
   --time-buckets <n>       Number of timeline buckets to emit (default: 0 = disabled)
-  --stage-profile          Enable Rust sync stage profiling (format/block/engine-write)
+  --stage-profile          Enable Rust stage profiling (sync + async breakdown)
   --json-pretty            Pretty-print JSON result
 ";
 
@@ -156,6 +157,7 @@ fn main() {
 fn run() -> Result<(), String> {
     let opts = parse_args()?;
     set_rust_sync_stage_profile_enabled(opts.stage_profile);
+    set_rust_async_stage_profile_enabled(opts.stage_profile);
     fs::create_dir_all(&opts.out_dir)
         .map_err(|e| format!("create out dir failed {}: {e}", opts.out_dir.display()))?;
     if let Some(cache_dir) = &opts.cache_dir {
@@ -304,7 +306,9 @@ fn run() -> Result<(), String> {
     logger.flush(true);
     drop(logger);
     let sync_stage_profile = take_rust_sync_stage_stats();
+    let async_stage_profile = take_rust_async_stage_stats();
     set_rust_sync_stage_profile_enabled(false);
+    set_rust_async_stage_profile_enabled(false);
     let total_elapsed = start.elapsed();
     let output_bytes_end = output_bytes(&opts.out_dir, opts.cache_dir.as_deref());
 
@@ -404,6 +408,15 @@ fn run() -> Result<(), String> {
         json.push_str(&sync_stage_profile_json(stats));
     } else {
         append_json_null(&mut json, "sync_stage_profile");
+    }
+    if let Some(stats) = async_stage_profile.as_ref() {
+        if !json.ends_with('{') {
+            json.push(',');
+        }
+        json.push_str("\"async_stage_profile\":");
+        json.push_str(&async_stage_profile_json(stats));
+    } else {
+        append_json_null(&mut json, "async_stage_profile");
     }
     json.push('}');
 
@@ -918,6 +931,40 @@ fn sync_stage_profile_json(stats: &RustSyncStageStats) -> String {
     json.push(',');
     json.push_str("\"engine_write\":");
     json.push_str(&stage_latency_json(&stats.engine_write));
+    json.push('}');
+    json
+}
+
+fn async_stage_profile_json(stats: &RustAsyncStageStats) -> String {
+    let mut json = String::new();
+    json.push('{');
+    append_json_num(&mut json, "samples", stats.samples as f64, 0);
+    if !json.ends_with('{') {
+        json.push(',');
+    }
+    json.push_str("\"total\":");
+    json.push_str(&stage_latency_json(&stats.total));
+    json.push(',');
+    json.push_str("\"format\":");
+    json.push_str(&stage_latency_json(&stats.format));
+    json.push(',');
+    json.push_str("\"checkout\":");
+    json.push_str(&stage_latency_json(&stats.checkout));
+    json.push(',');
+    json.push_str("\"checkout_lock\":");
+    json.push_str(&stage_latency_json(&stats.checkout_lock));
+    json.push(',');
+    json.push_str("\"checkout_wait\":");
+    json.push_str(&stage_latency_json(&stats.checkout_wait));
+    json.push(',');
+    json.push_str("\"begin_pending\":");
+    json.push_str(&stage_latency_json(&stats.begin_pending));
+    json.push(',');
+    json.push_str("\"append\":");
+    json.push_str(&stage_latency_json(&stats.append));
+    json.push(',');
+    json.push_str("\"force_flush\":");
+    json.push_str(&stage_latency_json(&stats.force_flush));
     json.push('}');
     json
 }
