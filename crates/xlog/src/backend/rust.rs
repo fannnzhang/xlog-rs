@@ -1,13 +1,25 @@
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::cell::{Cell, RefCell};
+use std::fmt::Write as _;
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
+use std::sync::mpsc::{
+    channel as std_channel, sync_channel, Receiver as StdReceiver, SendError, Sender as StdSender,
+    SyncSender, TryRecvError, TrySendError,
+};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use chrono::Local;
-use mars_xlog_core::appender_engine::{AppenderEngine, AppenderEngineError, EngineMode};
+use chrono::TimeZone;
+use crossbeam_queue::ArrayQueue;
+use mars_xlog_core::appender_engine::{AppenderEngine, EngineMode};
 use mars_xlog_core::buffer::{PersistentBuffer, DEFAULT_BUFFER_BLOCK_LEN};
 use mars_xlog_core::compress::{StreamCompressor, ZlibStreamCompressor, ZstdStreamCompressor};
 use mars_xlog_core::crypto::EcdhTeaCipher;
 use mars_xlog_core::dump::{dump_to_file, memory_dump};
 use mars_xlog_core::file_manager::FileManager;
+use mars_xlog_core::formatter::format_record_parts_into;
 use mars_xlog_core::oneshot::{
     oneshot_flush as core_oneshot_flush, FileIoAction as CoreFileIoAction,
 };
@@ -21,14 +33,15 @@ use mars_xlog_core::platform_console::{set_apple_console_fun, AppleConsoleFun};
 use mars_xlog_core::platform_console::{write_console_line, ConsoleLevel};
 use mars_xlog_core::platform_tid::{current_tid, main_tid};
 use mars_xlog_core::protocol::{
-    select_magic, AppendMode, CompressionKind, LogHeader, SeqGenerator, HEADER_LEN, MAGIC_END,
+    select_magic, AppendMode, CompressionKind, LogHeader, SeqGenerator, HEADER_LEN,
 };
-use mars_xlog_core::record::{LogLevel as CoreLogLevel, LogRecord};
+use mars_xlog_core::record::LogLevel as CoreLogLevel;
 use mars_xlog_core::registry::InstanceRegistry;
 
 use super::{XlogBackend, XlogBackendProvider};
 use crate::{
-    AppenderMode, CompressMode, FileIoAction, LogLevel, RawLogMeta, XlogConfig, XlogError,
+    AppenderMode, CompressMode, FileIoAction, LogLevel, RawLogMeta, RustAsyncStageStats,
+    RustSyncStageStats, StageLatencyStats, XlogConfig, XlogError,
 };
 
 #[cfg(any(
@@ -52,8 +65,44 @@ struct RustBackend {
     level: AtomicI32,
     console_open: AtomicBool,
     cipher: EcdhTeaCipher,
-    engine: AppenderEngine,
-    async_state: Mutex<Option<AsyncPendingState>>,
+    engine: Arc<AppenderEngine>,
+    async_frontend: AsyncFrontend,
+    async_state: Mutex<AsyncStateSlot>,
+    async_state_ready: Condvar,
+}
+
+struct AsyncFrontend {
+    tx: SyncSender<AsyncFrontendCommand>,
+    accepting: Arc<AtomicBool>,
+    flush_queued: Arc<AtomicBool>,
+    line_pools: Arc<[ArrayQueue<String>]>,
+    producer_shard_mask: AtomicU32,
+    full_retry_before_block: usize,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+enum AsyncFrontendCommand {
+    Write(AsyncWriteCommand),
+    Flush {
+        sync: bool,
+        ack: Option<StdSender<()>>,
+    },
+    Stop {
+        ack: StdSender<()>,
+    },
+}
+
+struct AsyncWriteCommand {
+    line: String,
+    pool_shard: usize,
+    now_hour: u8,
+    force_flush: bool,
+    profile: Option<AsyncWriteFrontProfile>,
+}
+
+struct AsyncWriteFrontProfile {
+    format_ns: u64,
+    enqueue_ns: u64,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -85,71 +134,287 @@ impl AsyncCompressor {
 
 struct AsyncPendingState {
     header: LogHeader,
-    payload: Vec<u8>,
+    payload_len: usize,
     compressor: AsyncCompressor,
     crypt_tail: Vec<u8>,
     flush_epoch: u64,
 }
 
-impl AsyncPendingState {
-    fn pending_bytes_without_tailer(&self) -> Option<Vec<u8>> {
-        let mut header = self.header;
-        header.len = u32::try_from(self.payload.len()).ok()?;
-        let mut out = Vec::with_capacity(header.encode().len() + self.payload.len());
-        out.extend_from_slice(&header.encode());
-        out.extend_from_slice(&self.payload);
-        Some(out)
+struct AsyncStateSlot {
+    pending: Option<AsyncPendingState>,
+    busy: bool,
+}
+
+impl AsyncStateSlot {
+    fn empty() -> Self {
+        Self {
+            pending: None,
+            busy: false,
+        }
+    }
+}
+
+struct CheckedOutAsyncState<'a> {
+    backend: &'a RustBackend,
+    pending: Option<AsyncPendingState>,
+    checkout_lock_ns: u64,
+    checkout_wait_ns: u64,
+}
+
+impl CheckedOutAsyncState<'_> {
+    fn pending(&self) -> Option<&AsyncPendingState> {
+        self.pending.as_ref()
     }
 
-    fn append_chunk(&mut self, chunk: &[u8], cipher: &EcdhTeaCipher) -> bool {
-        let mut compressed = Vec::new();
-        if !self.compressor.compress_chunk(chunk, &mut compressed) {
+    fn pending_mut(&mut self) -> Option<&mut AsyncPendingState> {
+        self.pending.as_mut()
+    }
+
+    fn set_pending(&mut self, pending: Option<AsyncPendingState>) {
+        self.pending = pending;
+    }
+
+    fn checkout_lock_ns(&self) -> u64 {
+        self.checkout_lock_ns
+    }
+
+    fn checkout_wait_ns(&self) -> u64 {
+        self.checkout_wait_ns
+    }
+}
+
+impl Drop for CheckedOutAsyncState<'_> {
+    fn drop(&mut self) {
+        let mut guard = self
+            .backend
+            .async_state
+            .lock()
+            .expect("async state lock poisoned");
+        debug_assert!(guard.busy);
+        guard.pending = self.pending.take();
+        guard.busy = false;
+        self.backend.async_state_ready.notify_one();
+    }
+}
+
+impl AsyncPendingState {
+    fn append_chunk(
+        &mut self,
+        chunk: &[u8],
+        compress_scratch: &mut Vec<u8>,
+        crypto_scratch: &mut Vec<u8>,
+        cipher: &EcdhTeaCipher,
+        engine: &AppenderEngine,
+        end_hour: u8,
+        force_flush: bool,
+    ) -> bool {
+        compress_scratch.clear();
+        if !self.compressor.compress_chunk(chunk, compress_scratch) {
             return false;
         }
-        self.append_encrypted(&compressed, cipher)
+        self.append_encrypted(
+            compress_scratch,
+            crypto_scratch,
+            cipher,
+            engine,
+            end_hour,
+            force_flush,
+        )
     }
 
-    fn finalize(mut self, cipher: &EcdhTeaCipher) -> Option<Vec<u8>> {
-        let mut tail = Vec::new();
-        if !self.compressor.finish(&mut tail) {
-            return None;
+    fn finalize(
+        &mut self,
+        compress_scratch: &mut Vec<u8>,
+        crypto_scratch: &mut Vec<u8>,
+        cipher: &EcdhTeaCipher,
+        engine: &AppenderEngine,
+        end_hour: u8,
+        force_flush: bool,
+    ) -> bool {
+        compress_scratch.clear();
+        if !self.compressor.finish(compress_scratch) {
+            return false;
         }
-        if !self.append_encrypted(&tail, cipher) {
-            return None;
+        if !compress_scratch.is_empty()
+            && !self.append_encrypted(
+                compress_scratch,
+                crypto_scratch,
+                cipher,
+                engine,
+                end_hour,
+                force_flush,
+            )
+        {
+            return false;
         }
-        let mut header = self.header;
-        header.end_hour = chrono::Timelike::hour(&Local::now()) as u8;
-        header.len = u32::try_from(self.payload.len()).ok()?;
-        let mut out = Vec::with_capacity(header.encode().len() + self.payload.len() + 1);
-        out.extend_from_slice(&header.encode());
-        out.extend_from_slice(&self.payload);
-        out.push(MAGIC_END);
-        Some(out)
+        engine.finalize_async_pending(end_hour, force_flush).is_ok()
     }
 
-    fn append_encrypted(&mut self, input: &[u8], cipher: &EcdhTeaCipher) -> bool {
+    fn append_encrypted(
+        &mut self,
+        input: &[u8],
+        crypto_scratch: &mut Vec<u8>,
+        cipher: &EcdhTeaCipher,
+        engine: &AppenderEngine,
+        end_hour: u8,
+        force_flush: bool,
+    ) -> bool {
         if !cipher.enabled() {
-            self.payload.extend_from_slice(input);
+            if engine
+                .append_async_chunk(0, input, end_hour, force_flush)
+                .is_err()
+            {
+                return false;
+            }
+            self.payload_len = self.payload_len.saturating_add(input.len());
             return true;
         }
-        if !self.crypt_tail.is_empty() {
-            let trim = self.crypt_tail.len().min(self.payload.len());
-            self.payload.truncate(self.payload.len() - trim);
-        }
-
-        let mut merged = Vec::with_capacity(self.crypt_tail.len() + input.len());
-        merged.extend_from_slice(&self.crypt_tail);
-        merged.extend_from_slice(input);
-        let full_len = merged.len() / 8 * 8;
+        let previous_tail_len = self.crypt_tail.len();
+        crypto_scratch.clear();
+        crypto_scratch.extend_from_slice(&self.crypt_tail);
+        crypto_scratch.extend_from_slice(input);
+        let full_len = crypto_scratch.len() / 8 * 8;
         if full_len > 0 {
-            let encrypted = cipher.encrypt_async(&merged[..full_len]);
-            self.payload.extend_from_slice(&encrypted);
+            cipher.encrypt_async_in_place(&mut crypto_scratch[..full_len]);
         }
 
+        let next_payload_len = self
+            .payload_len
+            .saturating_sub(previous_tail_len)
+            .saturating_add(crypto_scratch.len());
+        if engine
+            .append_async_chunk(previous_tail_len, crypto_scratch, end_hour, force_flush)
+            .is_err()
+        {
+            return false;
+        }
         self.crypt_tail.clear();
-        self.crypt_tail.extend_from_slice(&merged[full_len..]);
-        self.payload.extend_from_slice(&self.crypt_tail);
+        self.crypt_tail
+            .extend_from_slice(&crypto_scratch[full_len..]);
+        self.payload_len = next_payload_len;
         true
+    }
+}
+
+struct HotPathScratch {
+    line: String,
+    block: Vec<u8>,
+    compress: Vec<u8>,
+    crypto: Vec<u8>,
+}
+
+impl HotPathScratch {
+    fn new() -> Self {
+        Self {
+            line: String::with_capacity(16 * 1024),
+            block: Vec::with_capacity(DEFAULT_BUFFER_BLOCK_LEN),
+            compress: Vec::with_capacity(16 * 1024),
+            crypto: Vec::with_capacity(16 * 1024),
+        }
+    }
+}
+
+thread_local! {
+    static HOT_PATH_SCRATCH: RefCell<HotPathScratch> = RefCell::new(HotPathScratch::new());
+}
+
+fn with_hot_path_scratch<R>(f: impl FnOnce(&mut HotPathScratch) -> R) -> R {
+    HOT_PATH_SCRATCH.with(|scratch| match scratch.try_borrow_mut() {
+        Ok(mut borrowed) => f(&mut borrowed),
+        Err(_) => {
+            let mut fallback = HotPathScratch::new();
+            f(&mut fallback)
+        }
+    })
+}
+
+#[derive(Default)]
+struct HourCache {
+    epoch_second: i64,
+    hour: u8,
+    valid: bool,
+}
+
+thread_local! {
+    static HOUR_CACHE: RefCell<HourCache> = RefCell::new(HourCache {
+        epoch_second: 0,
+        hour: 0,
+        valid: false,
+    });
+}
+
+#[derive(Copy, Clone)]
+struct SyncStageSample {
+    total_ns: u64,
+    format_ns: u64,
+    block_ns: u64,
+    engine_write_ns: u64,
+}
+
+#[derive(Default)]
+struct SyncBuildStage {
+    format_ns: u64,
+    block_ns: u64,
+}
+
+#[derive(Copy, Clone)]
+struct AsyncStageSample {
+    total_ns: u64,
+    format_ns: u64,
+    checkout_ns: u64,
+    checkout_lock_ns: u64,
+    checkout_wait_ns: u64,
+    begin_pending_ns: u64,
+    append_ns: u64,
+    force_flush_ns: u64,
+}
+
+#[derive(Default)]
+struct AsyncBuildStage {
+    format_ns: u64,
+    checkout_ns: u64,
+    checkout_lock_ns: u64,
+    checkout_wait_ns: u64,
+    begin_pending_ns: u64,
+    append_ns: u64,
+    force_flush_ns: u64,
+}
+
+struct SyncStageProfiler {
+    enabled: AtomicBool,
+    samples: Mutex<Vec<SyncStageSample>>,
+}
+
+impl SyncStageProfiler {
+    fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            samples: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+struct AsyncStageProfiler {
+    enabled: AtomicBool,
+    samples: Mutex<Vec<AsyncStageSample>>,
+    queue_full_count: AtomicU64,
+    block_send_count: AtomicU64,
+    block_send_ns: AtomicU64,
+    queue_depth_current: AtomicUsize,
+    queue_depth_high_watermark: AtomicUsize,
+}
+
+impl AsyncStageProfiler {
+    fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            samples: Mutex::new(Vec::new()),
+            queue_full_count: AtomicU64::new(0),
+            block_send_count: AtomicU64::new(0),
+            block_send_ns: AtomicU64::new(0),
+            queue_depth_current: AtomicUsize::new(0),
+            queue_depth_high_watermark: AtomicUsize::new(0),
+        }
     }
 }
 
@@ -157,9 +422,833 @@ static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 static GLOBAL_MAX_FILE_SIZE: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_MAX_ALIVE_TIME: AtomicI64 = AtomicI64::new(0);
 static GLOBAL_CONSOLE_OPEN: AtomicBool = AtomicBool::new(false);
+static SYNC_STAGE_PROFILER: OnceLock<SyncStageProfiler> = OnceLock::new();
+static ASYNC_STAGE_PROFILER: OnceLock<AsyncStageProfiler> = OnceLock::new();
 
 const ASYNC_WARNING_THRESHOLD_NUM: usize = 4;
 const ASYNC_WARNING_THRESHOLD_DEN: usize = 5;
+const ASYNC_FRONTEND_QUEUE_CAPACITY: usize = 65536;
+const ASYNC_FRONTEND_FULL_RETRY_BEFORE_BLOCK_DEFAULT: usize = 4;
+const ASYNC_FRONTEND_FULL_RETRY_BEFORE_BLOCK_ZSTD: usize = 1;
+const ASYNC_FRONTEND_WRITE_BATCH_MAX: usize = 128;
+const ASYNC_LINE_POOL_SHARDS: usize = 16;
+const ASYNC_LINE_POOL_MAX_BUFFERS_PER_SHARD: usize = 256;
+const ASYNC_LINE_POOL_MAX_CAPACITY: usize = 8 * 1024;
+const ASYNC_LINE_BUFFER_INIT_CAPACITY: usize = 512;
+const ASYNC_LINE_POOL_SHARD_SENTINEL: usize = usize::MAX;
+
+fn current_async_line_pool_shard() -> usize {
+    thread_local! {
+        static ASYNC_LINE_POOL_SHARD: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+    ASYNC_LINE_POOL_SHARD.with(|slot| {
+        let cached = slot.get();
+        if cached != usize::MAX {
+            return cached;
+        }
+        let shard = (current_tid().unsigned_abs() as usize) % ASYNC_LINE_POOL_SHARDS;
+        slot.set(shard);
+        shard
+    })
+}
+
+impl AsyncFrontend {
+    fn new(engine: Arc<AppenderEngine>, config: XlogConfig, cipher: EcdhTeaCipher) -> Self {
+        let (tx, rx) = sync_channel::<AsyncFrontendCommand>(ASYNC_FRONTEND_QUEUE_CAPACITY);
+        let accepting = Arc::new(AtomicBool::new(true));
+        let flush_queued = Arc::new(AtomicBool::new(false));
+        let full_retry_before_block = match config.compress_mode {
+            CompressMode::Zstd => ASYNC_FRONTEND_FULL_RETRY_BEFORE_BLOCK_ZSTD,
+            CompressMode::Zlib => ASYNC_FRONTEND_FULL_RETRY_BEFORE_BLOCK_DEFAULT,
+        };
+        let line_pools = Arc::<[ArrayQueue<String>]>::from(
+            (0..ASYNC_LINE_POOL_SHARDS)
+                .map(|_| ArrayQueue::new(ASYNC_LINE_POOL_MAX_BUFFERS_PER_SHARD))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        let worker_flush_queued = Arc::clone(&flush_queued);
+        let worker_line_pools = Arc::clone(&line_pools);
+        let worker = thread::Builder::new()
+            .name("xlog-rust-async-frontend".to_string())
+            .spawn(move || {
+                run_async_frontend_worker(
+                    rx,
+                    worker_flush_queued,
+                    worker_line_pools,
+                    engine,
+                    config,
+                    cipher,
+                );
+            })
+            .expect("spawn rust async frontend worker");
+        Self {
+            tx,
+            accepting,
+            flush_queued,
+            line_pools,
+            producer_shard_mask: AtomicU32::new(0),
+            full_retry_before_block,
+            worker: Mutex::new(Some(worker)),
+        }
+    }
+
+    fn enqueue_write(&self, mut cmd: AsyncWriteCommand) -> Result<(), AsyncWriteCommand> {
+        let enqueue_begin = cmd.profile.as_ref().map(|_| Instant::now());
+        let mut full_retries = 0usize;
+        loop {
+            if !self.accepting.load(Ordering::Acquire) {
+                return Err(cmd);
+            }
+            if let (Some(begin), Some(front)) = (enqueue_begin, cmd.profile.as_mut()) {
+                front.enqueue_ns = begin.elapsed().as_nanos() as u64;
+            }
+            match self.tx.try_send(AsyncFrontendCommand::Write(cmd)) {
+                Ok(()) => {
+                    if enqueue_begin.is_some() {
+                        record_async_enqueued();
+                    }
+                    return Ok(());
+                }
+                Err(TrySendError::Disconnected(AsyncFrontendCommand::Write(v))) => return Err(v),
+                Err(TrySendError::Full(AsyncFrontendCommand::Write(v))) => {
+                    if enqueue_begin.is_some() {
+                        record_async_queue_full();
+                    }
+                    cmd = v;
+                    full_retries = full_retries.saturating_add(1);
+                    if full_retries >= self.full_retry_before_block {
+                        if !self.accepting.load(Ordering::Acquire) {
+                            return Err(cmd);
+                        }
+                        let block_begin = enqueue_begin.map(|_| Instant::now());
+                        return match self.tx.send(AsyncFrontendCommand::Write(cmd)) {
+                            Ok(()) => {
+                                if let Some(begin) = block_begin {
+                                    record_async_block_send(begin.elapsed().as_nanos() as u64);
+                                    record_async_enqueued();
+                                }
+                                Ok(())
+                            }
+                            Err(SendError(AsyncFrontendCommand::Write(v))) => {
+                                if let Some(begin) = block_begin {
+                                    record_async_block_send(begin.elapsed().as_nanos() as u64);
+                                }
+                                Err(v)
+                            }
+                            Err(_) => unreachable!("unexpected async frontend command variant"),
+                        };
+                    }
+                    thread::yield_now();
+                }
+                Err(_) => unreachable!("unexpected async frontend command variant"),
+            }
+        }
+    }
+
+    fn request_flush(&self, sync: bool) -> bool {
+        if sync {
+            let (ack_tx, ack_rx) = std_channel::<()>();
+            if self
+                .tx
+                .send(AsyncFrontendCommand::Flush {
+                    sync: true,
+                    ack: Some(ack_tx),
+                })
+                .is_err()
+            {
+                return false;
+            }
+            return ack_rx.recv().is_ok();
+        }
+
+        if self.flush_queued.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+        match self.tx.try_send(AsyncFrontendCommand::Flush {
+            sync: false,
+            ack: None,
+        }) {
+            Ok(()) => true,
+            Err(TrySendError::Disconnected(_)) => {
+                self.flush_queued.store(false, Ordering::Release);
+                false
+            }
+            Err(TrySendError::Full(_)) => {
+                self.flush_queued.store(false, Ordering::Release);
+                true
+            }
+        }
+    }
+
+    fn set_accepting(&self, enabled: bool) {
+        self.accepting.store(enabled, Ordering::Release);
+    }
+
+    fn take_line_buffer(&self, shard: usize) -> String {
+        if let Some(mut line) = self.line_pools[shard].pop() {
+            line.clear();
+            return line;
+        }
+        String::with_capacity(ASYNC_LINE_BUFFER_INIT_CAPACITY)
+    }
+
+    fn recycle_line_buffer(&self, shard: usize, mut line: String) {
+        if shard == ASYNC_LINE_POOL_SHARD_SENTINEL {
+            return;
+        }
+        if line.capacity() > ASYNC_LINE_POOL_MAX_CAPACITY {
+            return;
+        }
+        line.clear();
+        let _ = self.line_pools[shard].push(line);
+    }
+
+    fn should_use_pooled_line_path(&self, shard: usize) -> bool {
+        let bit = 1u32 << shard;
+        let mask = self.producer_shard_mask.fetch_or(bit, Ordering::AcqRel) | bit;
+        mask.count_ones() > 1
+    }
+
+    fn shutdown(&self) {
+        self.set_accepting(false);
+        let (ack_tx, ack_rx) = std_channel::<()>();
+        let _ = self.tx.send(AsyncFrontendCommand::Stop { ack: ack_tx });
+        let _ = ack_rx.recv_timeout(Duration::from_secs(2));
+        if let Ok(mut guard) = self.worker.lock() {
+            if let Some(handle) = guard.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+fn run_async_frontend_worker(
+    rx: StdReceiver<AsyncFrontendCommand>,
+    flush_queued: Arc<AtomicBool>,
+    line_pools: Arc<[ArrayQueue<String>]>,
+    engine: Arc<AppenderEngine>,
+    config: XlogConfig,
+    cipher: EcdhTeaCipher,
+) {
+    let capacity = engine.buffer_capacity();
+    let mut pending: Option<AsyncPendingState> = None;
+    let mut compress_scratch = Vec::with_capacity(16 * 1024);
+    let mut crypto_scratch = Vec::with_capacity(16 * 1024);
+    let mut block_scratch = Vec::with_capacity(DEFAULT_BUFFER_BLOCK_LEN);
+
+    loop {
+        let first = match rx.recv() {
+            Ok(cmd) => cmd,
+            Err(_) => break,
+        };
+        match first {
+            AsyncFrontendCommand::Write(cmd) => {
+                let mut cmd = cmd;
+                if cmd.profile.is_some() {
+                    record_async_dequeued();
+                }
+                handle_async_frontend_write(
+                    &mut cmd,
+                    &engine,
+                    &config,
+                    &cipher,
+                    capacity,
+                    &mut pending,
+                    &mut compress_scratch,
+                    &mut crypto_scratch,
+                    &mut block_scratch,
+                );
+                recycle_line_buffer_to_pool(line_pools.as_ref(), cmd.pool_shard, cmd.line);
+                let mut pending_control: Option<AsyncFrontendCommand> = None;
+                for _ in 0..ASYNC_FRONTEND_WRITE_BATCH_MAX.saturating_sub(1) {
+                    match rx.try_recv() {
+                        Ok(AsyncFrontendCommand::Write(next)) => {
+                            let mut next = next;
+                            if next.profile.is_some() {
+                                record_async_dequeued();
+                            }
+                            handle_async_frontend_write(
+                                &mut next,
+                                &engine,
+                                &config,
+                                &cipher,
+                                capacity,
+                                &mut pending,
+                                &mut compress_scratch,
+                                &mut crypto_scratch,
+                                &mut block_scratch,
+                            );
+                            recycle_line_buffer_to_pool(
+                                line_pools.as_ref(),
+                                next.pool_shard,
+                                next.line,
+                            );
+                        }
+                        Ok(control) => {
+                            pending_control = Some(control);
+                            break;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => return,
+                    }
+                }
+                if let Some(control) = pending_control {
+                    if handle_async_frontend_control(
+                        control,
+                        &flush_queued,
+                        &engine,
+                        &cipher,
+                        &mut pending,
+                        &mut compress_scratch,
+                        &mut crypto_scratch,
+                    ) {
+                        break;
+                    }
+                }
+            }
+            control => {
+                if handle_async_frontend_control(
+                    control,
+                    &flush_queued,
+                    &engine,
+                    &cipher,
+                    &mut pending,
+                    &mut compress_scratch,
+                    &mut crypto_scratch,
+                ) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn handle_async_frontend_control(
+    cmd: AsyncFrontendCommand,
+    flush_queued: &AtomicBool,
+    engine: &AppenderEngine,
+    cipher: &EcdhTeaCipher,
+    pending: &mut Option<AsyncPendingState>,
+    compress_scratch: &mut Vec<u8>,
+    crypto_scratch: &mut Vec<u8>,
+) -> bool {
+    match cmd {
+        AsyncFrontendCommand::Flush { sync, ack } => {
+            flush_queued.store(false, Ordering::Release);
+            worker_finalize_pending(engine, cipher, pending, compress_scratch, crypto_scratch);
+            let _ = engine.flush(sync);
+            if let Some(ack) = ack {
+                let _ = ack.send(());
+            }
+            false
+        }
+        AsyncFrontendCommand::Stop { ack } => {
+            flush_queued.store(false, Ordering::Release);
+            worker_finalize_pending(engine, cipher, pending, compress_scratch, crypto_scratch);
+            let _ = engine.flush(true);
+            let _ = ack.send(());
+            true
+        }
+        AsyncFrontendCommand::Write(_) => false,
+    }
+}
+
+fn recycle_line_buffer_to_pool(
+    pools: &[ArrayQueue<String>],
+    shard: usize,
+    mut line: String,
+) {
+    if shard == ASYNC_LINE_POOL_SHARD_SENTINEL {
+        return;
+    }
+    if line.capacity() > ASYNC_LINE_POOL_MAX_CAPACITY {
+        return;
+    }
+    line.clear();
+    let _ = pools[shard].push(line);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_async_frontend_write(
+    cmd: &mut AsyncWriteCommand,
+    engine: &AppenderEngine,
+    config: &XlogConfig,
+    cipher: &EcdhTeaCipher,
+    capacity: usize,
+    pending: &mut Option<AsyncPendingState>,
+    compress_scratch: &mut Vec<u8>,
+    crypto_scratch: &mut Vec<u8>,
+    block_scratch: &mut Vec<u8>,
+) {
+    let mut stage = AsyncBuildStage::default();
+    let mut profile_enabled = false;
+    if let Some(front) = cmd.profile.as_ref() {
+        profile_enabled = true;
+        stage.format_ns = front.format_ns;
+        stage.checkout_ns = front.enqueue_ns;
+        stage.checkout_wait_ns = 0;
+    }
+
+    if engine.mode() != EngineMode::Async {
+        let append_begin = profile_enabled.then(Instant::now);
+        if build_sync_block_from_formatted_line(
+            config,
+            cipher,
+            cmd.now_hour,
+            cmd.line.as_str(),
+            block_scratch,
+        ) {
+            let _ = engine.write_block(block_scratch.as_slice(), cmd.force_flush);
+        }
+        if let Some(begin) = append_begin {
+            stage.append_ns = begin.elapsed().as_nanos() as u64;
+        }
+        if profile_enabled {
+            let total_ns = stage
+                .format_ns
+                .saturating_add(stage.checkout_ns)
+                .saturating_add(stage.checkout_wait_ns)
+                .saturating_add(stage.append_ns);
+            record_async_stage_sample(AsyncStageSample {
+                total_ns,
+                format_ns: stage.format_ns,
+                checkout_ns: stage.checkout_ns,
+                checkout_lock_ns: 0,
+                checkout_wait_ns: stage.checkout_wait_ns,
+                begin_pending_ns: 0,
+                append_ns: stage.append_ns,
+                force_flush_ns: 0,
+            });
+        }
+        return;
+    }
+
+    let engine_epoch = engine.async_flush_epoch();
+    if pending
+        .as_ref()
+        .map(|s| s.flush_epoch != engine_epoch)
+        .unwrap_or(false)
+    {
+        *pending = None;
+    }
+
+    if pending.is_none() {
+        let Some(new_state) =
+            new_async_pending_state_for(config, cipher, cmd.now_hour, engine_epoch)
+        else {
+            return;
+        };
+        let begin_pending_begin = profile_enabled.then(Instant::now);
+        if engine.begin_async_pending(&new_state.header).is_err() {
+            return;
+        }
+        if let Some(begin) = begin_pending_begin {
+            stage.begin_pending_ns = begin.elapsed().as_nanos() as u64;
+        }
+        *pending = Some(new_state);
+    }
+
+    let Some(state) = pending.as_mut() else {
+        return;
+    };
+
+    let threshold =
+        capacity.saturating_mul(ASYNC_WARNING_THRESHOLD_NUM) / ASYNC_WARNING_THRESHOLD_DEN;
+    let current_len = HEADER_LEN + state.payload_len;
+    let mut warning_line = None;
+    if current_len >= threshold {
+        warning_line = Some(format!(
+            "[F][ sg_buffer_async.Length() >= BUFFER_BLOCK_LENTH*4/5, len: {current_len}\n"
+        ));
+    }
+    let line = warning_line.as_deref().unwrap_or(cmd.line.as_str());
+
+    state.header.end_hour = cmd.now_hour;
+    let append_begin = profile_enabled.then(Instant::now);
+    let appended = state.append_chunk(
+        line.as_bytes(),
+        compress_scratch,
+        crypto_scratch,
+        cipher,
+        engine,
+        cmd.now_hour,
+        cmd.force_flush,
+    );
+    if let Some(begin) = append_begin {
+        stage.append_ns = begin.elapsed().as_nanos() as u64;
+    }
+    if !appended {
+        *pending = None;
+        let force_flush_begin = profile_enabled.then(Instant::now);
+        let _ = engine.flush(true);
+        if let Some(begin) = force_flush_begin {
+            stage.force_flush_ns = begin.elapsed().as_nanos() as u64;
+        }
+    }
+
+    if profile_enabled {
+        let total_ns = stage
+            .format_ns
+            .saturating_add(stage.checkout_ns)
+            .saturating_add(stage.checkout_wait_ns)
+            .saturating_add(stage.begin_pending_ns)
+            .saturating_add(stage.append_ns)
+            .saturating_add(stage.force_flush_ns);
+        record_async_stage_sample(AsyncStageSample {
+            total_ns,
+            format_ns: stage.format_ns,
+            checkout_ns: stage.checkout_ns,
+            checkout_lock_ns: 0,
+            checkout_wait_ns: stage.checkout_wait_ns,
+            begin_pending_ns: stage.begin_pending_ns,
+            append_ns: stage.append_ns,
+            force_flush_ns: stage.force_flush_ns,
+        });
+    }
+}
+
+fn worker_finalize_pending(
+    engine: &AppenderEngine,
+    cipher: &EcdhTeaCipher,
+    pending: &mut Option<AsyncPendingState>,
+    compress_scratch: &mut Vec<u8>,
+    crypto_scratch: &mut Vec<u8>,
+) {
+    let Some(state) = pending.as_mut() else {
+        return;
+    };
+    let now_hour = local_hour_from_timestamp(std::time::SystemTime::now());
+    let finalized = state.finalize(
+        compress_scratch,
+        crypto_scratch,
+        cipher,
+        engine,
+        now_hour,
+        false,
+    );
+    *pending = None;
+    if !finalized && engine.mode() == EngineMode::Async {
+        let _ = engine.flush(true);
+    }
+}
+
+fn new_async_pending_state_for(
+    config: &XlogConfig,
+    cipher: &EcdhTeaCipher,
+    hour: u8,
+    flush_epoch: u64,
+) -> Option<AsyncPendingState> {
+    let compression_kind = match config.compress_mode {
+        CompressMode::Zlib => CompressionKind::Zlib,
+        CompressMode::Zstd => CompressionKind::Zstd,
+    };
+    let compressor = match config.compress_mode {
+        CompressMode::Zlib => {
+            AsyncCompressor::Zlib(ZlibStreamCompressor::new(config.compress_level))
+        }
+        CompressMode::Zstd => {
+            AsyncCompressor::Zstd(ZstdStreamCompressor::new(config.compress_level).ok()?)
+        }
+    };
+    Some(AsyncPendingState {
+        header: LogHeader {
+            magic: select_magic(compression_kind, AppendMode::Async, cipher.enabled()),
+            seq: global_async_seq().next_async(),
+            begin_hour: hour,
+            end_hour: hour,
+            len: 0,
+            client_pubkey: if cipher.enabled() {
+                cipher.client_pubkey()
+            } else {
+                [0; 64]
+            },
+        },
+        payload_len: 0,
+        compressor,
+        crypt_tail: Vec::with_capacity(8),
+        flush_epoch,
+    })
+}
+
+fn build_sync_block_from_formatted_line(
+    config: &XlogConfig,
+    cipher: &EcdhTeaCipher,
+    hour: u8,
+    line: &str,
+    block: &mut Vec<u8>,
+) -> bool {
+    let compression_kind = match config.compress_mode {
+        CompressMode::Zlib => CompressionKind::Zlib,
+        CompressMode::Zstd => CompressionKind::Zstd,
+    };
+    let Some(len) = u32::try_from(line.len()).ok() else {
+        return false;
+    };
+    let header = LogHeader {
+        magic: select_magic(compression_kind, AppendMode::Sync, cipher.enabled()),
+        seq: SeqGenerator::sync_seq(),
+        begin_hour: hour,
+        end_hour: hour,
+        len,
+        client_pubkey: if cipher.enabled() {
+            cipher.client_pubkey()
+        } else {
+            [0; 64]
+        },
+    };
+    block.clear();
+    block.reserve(HEADER_LEN + line.len() + 1);
+    block.extend_from_slice(&header.encode());
+    block.extend_from_slice(line.as_bytes());
+    block.push(0);
+    true
+}
+
+fn sync_stage_profiler() -> &'static SyncStageProfiler {
+    SYNC_STAGE_PROFILER.get_or_init(SyncStageProfiler::new)
+}
+
+fn async_stage_profiler() -> &'static AsyncStageProfiler {
+    ASYNC_STAGE_PROFILER.get_or_init(AsyncStageProfiler::new)
+}
+
+fn sync_stage_profile_enabled() -> bool {
+    sync_stage_profiler().enabled.load(Ordering::Relaxed)
+}
+
+fn async_stage_profile_enabled() -> bool {
+    async_stage_profiler().enabled.load(Ordering::Relaxed)
+}
+
+fn record_sync_stage_sample(sample: SyncStageSample) {
+    let profiler = sync_stage_profiler();
+    if !profiler.enabled.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Ok(mut samples) = profiler.samples.lock() {
+        samples.push(sample);
+    }
+}
+
+fn record_async_stage_sample(sample: AsyncStageSample) {
+    let profiler = async_stage_profiler();
+    if !profiler.enabled.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Ok(mut samples) = profiler.samples.lock() {
+        samples.push(sample);
+    }
+}
+
+fn record_async_queue_full() {
+    let profiler = async_stage_profiler();
+    if !profiler.enabled.load(Ordering::Relaxed) {
+        return;
+    }
+    profiler.queue_full_count.fetch_add(1, Ordering::Relaxed);
+}
+
+fn record_async_block_send(block_ns: u64) {
+    let profiler = async_stage_profiler();
+    if !profiler.enabled.load(Ordering::Relaxed) {
+        return;
+    }
+    profiler.block_send_count.fetch_add(1, Ordering::Relaxed);
+    profiler.block_send_ns.fetch_add(block_ns, Ordering::Relaxed);
+}
+
+fn record_async_enqueued() {
+    let profiler = async_stage_profiler();
+    if !profiler.enabled.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let depth = profiler
+        .queue_depth_current
+        .fetch_add(1, Ordering::AcqRel)
+        .saturating_add(1);
+    let depth_for_high = depth.min(ASYNC_FRONTEND_QUEUE_CAPACITY);
+    let mut current_max = profiler.queue_depth_high_watermark.load(Ordering::Acquire);
+    while depth_for_high > current_max {
+        match profiler.queue_depth_high_watermark.compare_exchange_weak(
+            current_max,
+            depth_for_high,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(v) => current_max = v,
+        }
+    }
+}
+
+fn record_async_dequeued() {
+    let profiler = async_stage_profiler();
+    if !profiler.enabled.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut current = profiler.queue_depth_current.load(Ordering::Acquire);
+    while current > 0 {
+        match profiler.queue_depth_current.compare_exchange_weak(
+            current,
+            current - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(v) => current = v,
+        }
+    }
+}
+
+fn local_hour_from_timestamp(timestamp: SystemTime) -> u8 {
+    if let Ok(since_epoch) = timestamp.duration_since(UNIX_EPOCH) {
+        let epoch_secs = since_epoch.as_secs();
+        if epoch_secs <= i64::MAX as u64 {
+            let epoch_second = epoch_secs as i64;
+            return HOUR_CACHE.with(|cache_cell| {
+                let mut cache = cache_cell.borrow_mut();
+                if !cache.valid || cache.epoch_second != epoch_second {
+                    if let Some(dt) = chrono::Local.timestamp_opt(epoch_second, 0).single() {
+                        cache.epoch_second = epoch_second;
+                        cache.hour = chrono::Timelike::hour(&dt) as u8;
+                        cache.valid = true;
+                    } else {
+                        return chrono::Timelike::hour(&chrono::Local::now()) as u8;
+                    }
+                }
+                cache.hour
+            });
+        }
+    }
+    chrono::Timelike::hour(&chrono::Local::now()) as u8
+}
+
+fn stage_stats(values: &mut [u64]) -> StageLatencyStats {
+    if values.is_empty() {
+        return StageLatencyStats::default();
+    }
+    values.sort_unstable();
+    let len = values.len();
+    let sum = values
+        .iter()
+        .fold(0u128, |acc, &v| acc.saturating_add(v as u128));
+    StageLatencyStats {
+        avg_ns: sum as f64 / len as f64,
+        p50_ns: percentile_from_sorted(values, 500),
+        p95_ns: percentile_from_sorted(values, 950),
+        p99_ns: percentile_from_sorted(values, 990),
+        max_ns: *values.last().unwrap_or(&0),
+    }
+}
+
+fn percentile_from_sorted(sorted: &[u64], per_mille: usize) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let last = sorted.len().saturating_sub(1);
+    let idx = ((last as u128 * per_mille as u128) / 1000u128) as usize;
+    sorted[idx.min(last)]
+}
+
+pub(super) fn set_sync_stage_profile_enabled(enabled: bool) {
+    let profiler = sync_stage_profiler();
+    profiler.enabled.store(enabled, Ordering::Relaxed);
+    if let Ok(mut samples) = profiler.samples.lock() {
+        samples.clear();
+    }
+}
+
+pub(super) fn take_sync_stage_stats() -> Option<RustSyncStageStats> {
+    let profiler = sync_stage_profiler();
+    let mut samples = profiler.samples.lock().ok()?;
+    if samples.is_empty() {
+        return None;
+    }
+    let snapshot = std::mem::take(&mut *samples);
+    drop(samples);
+
+    let mut total = Vec::with_capacity(snapshot.len());
+    let mut format = Vec::with_capacity(snapshot.len());
+    let mut block = Vec::with_capacity(snapshot.len());
+    let mut engine = Vec::with_capacity(snapshot.len());
+    for sample in snapshot {
+        total.push(sample.total_ns);
+        format.push(sample.format_ns);
+        block.push(sample.block_ns);
+        engine.push(sample.engine_write_ns);
+    }
+
+    Some(RustSyncStageStats {
+        samples: total.len(),
+        total: stage_stats(total.as_mut_slice()),
+        format: stage_stats(format.as_mut_slice()),
+        block: stage_stats(block.as_mut_slice()),
+        engine_write: stage_stats(engine.as_mut_slice()),
+    })
+}
+
+pub(super) fn set_async_stage_profile_enabled(enabled: bool) {
+    let profiler = async_stage_profiler();
+    profiler.enabled.store(enabled, Ordering::Relaxed);
+    if let Ok(mut samples) = profiler.samples.lock() {
+        samples.clear();
+    }
+    profiler.queue_full_count.store(0, Ordering::Relaxed);
+    profiler.block_send_count.store(0, Ordering::Relaxed);
+    profiler.block_send_ns.store(0, Ordering::Relaxed);
+    profiler.queue_depth_current.store(0, Ordering::Relaxed);
+    profiler
+        .queue_depth_high_watermark
+        .store(0, Ordering::Relaxed);
+}
+
+pub(super) fn take_async_stage_stats() -> Option<RustAsyncStageStats> {
+    let profiler = async_stage_profiler();
+    let mut samples = profiler.samples.lock().ok()?;
+    if samples.is_empty() {
+        return None;
+    }
+    let snapshot = std::mem::take(&mut *samples);
+    drop(samples);
+
+    let mut total = Vec::with_capacity(snapshot.len());
+    let mut format = Vec::with_capacity(snapshot.len());
+    let mut checkout = Vec::with_capacity(snapshot.len());
+    let mut checkout_lock = Vec::with_capacity(snapshot.len());
+    let mut checkout_wait = Vec::with_capacity(snapshot.len());
+    let mut begin_pending = Vec::with_capacity(snapshot.len());
+    let mut append = Vec::with_capacity(snapshot.len());
+    let mut force_flush = Vec::with_capacity(snapshot.len());
+    for sample in snapshot {
+        total.push(sample.total_ns);
+        format.push(sample.format_ns);
+        checkout.push(sample.checkout_ns);
+        checkout_lock.push(sample.checkout_lock_ns);
+        checkout_wait.push(sample.checkout_wait_ns);
+        begin_pending.push(sample.begin_pending_ns);
+        append.push(sample.append_ns);
+        force_flush.push(sample.force_flush_ns);
+    }
+
+    Some(RustAsyncStageStats {
+        samples: total.len(),
+        total: stage_stats(total.as_mut_slice()),
+        format: stage_stats(format.as_mut_slice()),
+        checkout: stage_stats(checkout.as_mut_slice()),
+        checkout_lock: stage_stats(checkout_lock.as_mut_slice()),
+        checkout_wait: stage_stats(checkout_wait.as_mut_slice()),
+        begin_pending: stage_stats(begin_pending.as_mut_slice()),
+        append: stage_stats(append.as_mut_slice()),
+        force_flush: stage_stats(force_flush.as_mut_slice()),
+        queue_full_count: profiler.queue_full_count.load(Ordering::Relaxed),
+        block_send_count: profiler.block_send_count.load(Ordering::Relaxed),
+        block_send_ns: profiler.block_send_ns.load(Ordering::Relaxed),
+        queue_depth_high_watermark: profiler.queue_depth_high_watermark.load(Ordering::Relaxed)
+            as u64,
+    })
+}
 
 fn registry() -> &'static InstanceRegistry<RustBackend> {
     static REGISTRY: OnceLock<InstanceRegistry<RustBackend>> = OnceLock::new();
@@ -198,13 +1287,16 @@ impl RustBackend {
         )
         .map_err(|_| XlogError::InitFailed)?;
 
-        let engine = AppenderEngine::new(
+        let engine = Arc::new(AppenderEngine::new(
             file_manager,
             buffer,
             appender_to_engine_mode(config.mode),
             0,
             10 * 24 * 60 * 60,
-        );
+        ));
+        let async_frontend =
+            AsyncFrontend::new(Arc::clone(&engine), config.clone(), cipher.clone());
+        async_frontend.set_accepting(config.mode == AppenderMode::Async);
 
         Ok(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -213,12 +1305,58 @@ impl RustBackend {
             config,
             cipher,
             engine,
-            async_state: Mutex::new(None),
+            async_frontend,
+            async_state: Mutex::new(AsyncStateSlot::empty()),
+            async_state_ready: Condvar::new(),
         })
     }
 
-    fn build_block(
+    fn checkout_async_state(&self, profile_enabled: bool) -> CheckedOutAsyncState<'_> {
+        if let Ok(mut guard) = self.async_state.try_lock() {
+            if !guard.busy {
+                guard.busy = true;
+                return CheckedOutAsyncState {
+                    backend: self,
+                    pending: guard.pending.take(),
+                    checkout_lock_ns: 0,
+                    checkout_wait_ns: 0,
+                };
+            }
+        }
+        let lock_begin = profile_enabled.then(Instant::now);
+        let mut guard = self.async_state.lock().expect("async state lock poisoned");
+        let checkout_lock_ns = lock_begin
+            .map(|b| b.elapsed().as_nanos() as u64)
+            .unwrap_or(0);
+        let mut checkout_wait_ns = 0u64;
+        while guard.busy {
+            if profile_enabled {
+                let wait_begin = Instant::now();
+                guard = self
+                    .async_state_ready
+                    .wait(guard)
+                    .expect("async state lock poisoned");
+                checkout_wait_ns =
+                    checkout_wait_ns.saturating_add(wait_begin.elapsed().as_nanos() as u64);
+            } else {
+                guard = self
+                    .async_state_ready
+                    .wait(guard)
+                    .expect("async state lock poisoned");
+            }
+        }
+        guard.busy = true;
+        CheckedOutAsyncState {
+            backend: self,
+            pending: guard.pending.take(),
+            checkout_lock_ns,
+            checkout_wait_ns,
+        }
+    }
+
+    fn build_sync_block_into<'a>(
         &self,
+        scratch: &'a mut HotPathScratch,
         level: LogLevel,
         tag: &str,
         file: &str,
@@ -228,87 +1366,61 @@ impl RustBackend {
         pid: i64,
         tid: i64,
         maintid: i64,
-    ) -> Option<Vec<u8>> {
-        let mode = engine_to_appender_mode(self.engine.mode());
-        let compress = self.config.compress_mode;
-
-        let now = Local::now();
-        let is_crypt = self.cipher.enabled();
-
-        let record = LogRecord {
-            level: to_core_level(level),
-            tag: tag.to_string(),
-            filename: file.to_string(),
-            func_name: func.to_string(),
-            line: line as i32,
-            timestamp: std::time::SystemTime::now(),
+        timestamp: SystemTime,
+        profile: Option<&mut SyncBuildStage>,
+    ) -> Option<&'a [u8]> {
+        let mut profile = profile;
+        let format_begin = profile.as_ref().map(|_| Instant::now());
+        let hour = local_hour_from_timestamp(timestamp);
+        self.format_record_line_into(
+            &mut scratch.line,
+            level,
+            tag,
+            file,
+            func,
+            line,
+            msg,
             pid,
             tid,
             maintid,
-        };
-        let line = mars_xlog_core::formatter::format_record(&record, msg);
-
-        let mut payload = match mode {
-            AppenderMode::Sync => line.into_bytes(),
-            AppenderMode::Async => match compress {
-                CompressMode::Zlib => {
-                    let mut c = ZlibStreamCompressor::default();
-                    let mut out = Vec::new();
-                    c.compress_chunk(line.as_bytes(), &mut out).ok()?;
-                    c.flush(&mut out).ok()?;
-                    out
-                }
-                CompressMode::Zstd => {
-                    let mut c = ZstdStreamCompressor::new(self.config.compress_level).ok()?;
-                    let mut out = Vec::new();
-                    c.compress_chunk(line.as_bytes(), &mut out).ok()?;
-                    c.flush(&mut out).ok()?;
-                    out
-                }
-            },
-        };
-
-        if is_crypt {
-            payload = match mode {
-                AppenderMode::Sync => self.cipher.encrypt_sync(&payload),
-                AppenderMode::Async => self.cipher.encrypt_async(&payload),
-            };
+            timestamp,
+        );
+        if let (Some(begin), Some(stage)) = (format_begin, profile.as_mut()) {
+            stage.format_ns = begin.elapsed().as_nanos() as u64;
         }
 
-        let compression_kind = match compress {
+        let block_begin = profile.as_ref().map(|_| Instant::now());
+        let compression_kind = match self.config.compress_mode {
             CompressMode::Zlib => CompressionKind::Zlib,
             CompressMode::Zstd => CompressionKind::Zstd,
         };
-        let append_mode = match mode {
-            AppenderMode::Sync => AppendMode::Sync,
-            AppenderMode::Async => AppendMode::Async,
-        };
-
         let header = LogHeader {
-            magic: select_magic(compression_kind, append_mode, is_crypt),
-            seq: match mode {
-                AppenderMode::Sync => SeqGenerator::sync_seq(),
-                AppenderMode::Async => global_async_seq().next_async(),
-            },
-            begin_hour: chrono::Timelike::hour(&now) as u8,
-            end_hour: chrono::Timelike::hour(&now) as u8,
-            len: u32::try_from(payload.len()).ok()?,
-            client_pubkey: if is_crypt {
+            magic: select_magic(compression_kind, AppendMode::Sync, self.cipher.enabled()),
+            seq: SeqGenerator::sync_seq(),
+            begin_hour: hour,
+            end_hour: hour,
+            len: u32::try_from(scratch.line.len()).ok()?,
+            client_pubkey: if self.cipher.enabled() {
                 self.cipher.client_pubkey()
             } else {
                 [0; 64]
             },
         };
 
-        let mut block = Vec::with_capacity(73 + payload.len() + 1);
-        block.extend_from_slice(&header.encode());
-        block.extend_from_slice(&payload);
-        block.push(MAGIC_END);
-        Some(block)
+        scratch.block.clear();
+        scratch.block.reserve(HEADER_LEN + scratch.line.len() + 1);
+        scratch.block.extend_from_slice(&header.encode());
+        scratch.block.extend_from_slice(scratch.line.as_bytes());
+        scratch.block.push(0);
+        if let (Some(begin), Some(stage)) = (block_begin, profile.as_mut()) {
+            stage.block_ns = begin.elapsed().as_nanos() as u64;
+        }
+        Some(scratch.block.as_slice())
     }
 
-    fn format_record_line(
+    fn format_record_line_into(
         &self,
+        out: &mut String,
         level: LogLevel,
         tag: &str,
         file: &str,
@@ -318,19 +1430,21 @@ impl RustBackend {
         pid: i64,
         tid: i64,
         maintid: i64,
-    ) -> String {
-        let record = LogRecord {
-            level: to_core_level(level),
-            tag: tag.to_string(),
-            filename: file.to_string(),
-            func_name: func.to_string(),
-            line: line as i32,
-            timestamp: std::time::SystemTime::now(),
+        timestamp: std::time::SystemTime,
+    ) {
+        format_record_parts_into(
+            out,
+            to_core_level(level),
+            tag,
+            file,
+            func,
+            line as i32,
+            timestamp,
             pid,
             tid,
             maintid,
-        };
-        mars_xlog_core::formatter::format_record(&record, msg)
+            msg,
+        );
     }
 
     fn resolve_record_meta(&self, raw_meta: RawLogMeta, mode: MetaResolveMode) -> (i64, i64, i64) {
@@ -400,42 +1514,52 @@ impl RustBackend {
             return;
         }
 
-        let Some(block) = self.build_block(level, tag, file, func, line, msg, pid, tid, maintid)
-        else {
-            return;
-        };
-        let _ = self.engine.write_block(&block, level == LogLevel::Fatal);
+        if sync_stage_profile_enabled() {
+            with_hot_path_scratch(|scratch| {
+                let total_begin = Instant::now();
+                let mut stage = SyncBuildStage::default();
+                let timestamp = SystemTime::now();
+                let Some(block) = self.build_sync_block_into(
+                    scratch,
+                    level,
+                    tag,
+                    file,
+                    func,
+                    line,
+                    msg,
+                    pid,
+                    tid,
+                    maintid,
+                    timestamp,
+                    Some(&mut stage),
+                ) else {
+                    return;
+                };
+                let engine_begin = Instant::now();
+                let _ = self.engine.write_block(block, level == LogLevel::Fatal);
+                let engine_write_ns = engine_begin.elapsed().as_nanos() as u64;
+                record_sync_stage_sample(SyncStageSample {
+                    total_ns: total_begin.elapsed().as_nanos() as u64,
+                    format_ns: stage.format_ns,
+                    block_ns: stage.block_ns,
+                    engine_write_ns,
+                });
+            });
+        } else {
+            with_hot_path_scratch(|scratch| {
+                let timestamp = SystemTime::now();
+                let Some(block) = self.build_sync_block_into(
+                    scratch, level, tag, file, func, line, msg, pid, tid, maintid, timestamp, None,
+                ) else {
+                    return;
+                };
+                let _ = self.engine.write_block(block, level == LogLevel::Fatal);
+            });
+        }
     }
 
     fn new_async_pending_state(&self, hour: u8, flush_epoch: u64) -> Option<AsyncPendingState> {
-        let compression_kind = match self.config.compress_mode {
-            CompressMode::Zlib => CompressionKind::Zlib,
-            CompressMode::Zstd => CompressionKind::Zstd,
-        };
-        let compressor = match self.config.compress_mode {
-            CompressMode::Zlib => AsyncCompressor::Zlib(ZlibStreamCompressor::default()),
-            CompressMode::Zstd => {
-                AsyncCompressor::Zstd(ZstdStreamCompressor::new(self.config.compress_level).ok()?)
-            }
-        };
-        Some(AsyncPendingState {
-            header: LogHeader {
-                magic: select_magic(compression_kind, AppendMode::Async, self.cipher.enabled()),
-                seq: global_async_seq().next_async(),
-                begin_hour: hour,
-                end_hour: hour,
-                len: 0,
-                client_pubkey: if self.cipher.enabled() {
-                    self.cipher.client_pubkey()
-                } else {
-                    [0; 64]
-                },
-            },
-            payload: Vec::new(),
-            compressor,
-            crypt_tail: Vec::new(),
-            flush_epoch,
-        })
+        new_async_pending_state_for(&self.config, &self.cipher, hour, flush_epoch)
     }
 
     fn write_async_line(
@@ -450,82 +1574,271 @@ impl RustBackend {
         tid: i64,
         maintid: i64,
     ) {
-        let line = self.format_record_line(level, tag, file, func, line, msg, pid, tid, maintid);
-        let now_hour = chrono::Timelike::hour(&Local::now()) as u8;
+        #[cfg(test)]
+        let force_inline = self
+            .async_state
+            .lock()
+            .ok()
+            .map(|s| s.pending.is_some())
+            .unwrap_or(false);
+        #[cfg(not(test))]
+        let force_inline = false;
+
+        if force_inline || !self.async_frontend.accepting.load(Ordering::Acquire) {
+            self.write_async_line_inline(level, tag, file, func, line, msg, pid, tid, maintid);
+            return;
+        }
+
+        let timestamp = std::time::SystemTime::now();
+        let now_hour = local_hour_from_timestamp(timestamp);
+        let profile_enabled = async_stage_profile_enabled();
+        let pool_shard = current_async_line_pool_shard();
+        if !self.async_frontend.should_use_pooled_line_path(pool_shard) {
+            let mut queued = false;
+            with_hot_path_scratch(|scratch| {
+                let format_begin = profile_enabled.then(Instant::now);
+                self.format_record_line_into(
+                    &mut scratch.line,
+                    level,
+                    tag,
+                    file,
+                    func,
+                    line,
+                    msg,
+                    pid,
+                    tid,
+                    maintid,
+                    timestamp,
+                );
+                let format_ns = format_begin
+                    .map(|begin| begin.elapsed().as_nanos() as u64)
+                    .unwrap_or(0);
+                let cmd = AsyncWriteCommand {
+                    line: scratch.line.clone(),
+                    pool_shard: ASYNC_LINE_POOL_SHARD_SENTINEL,
+                    now_hour,
+                    force_flush: level == LogLevel::Fatal,
+                    profile: profile_enabled.then(|| AsyncWriteFrontProfile {
+                        format_ns,
+                        enqueue_ns: 0,
+                    }),
+                };
+                queued = self.async_frontend.enqueue_write(cmd).is_ok();
+            });
+
+            if !queued {
+                self.write_async_line_inline(level, tag, file, func, line, msg, pid, tid, maintid);
+            }
+            return;
+        }
+
+        let mut line_buf = self.async_frontend.take_line_buffer(pool_shard);
+        let format_begin = profile_enabled.then(Instant::now);
+        self.format_record_line_into(
+            &mut line_buf,
+            level,
+            tag,
+            file,
+            func,
+            line,
+            msg,
+            pid,
+            tid,
+            maintid,
+            timestamp,
+        );
+        let format_ns = format_begin
+            .map(|begin| begin.elapsed().as_nanos() as u64)
+            .unwrap_or(0);
+        let cmd = AsyncWriteCommand {
+            line: line_buf,
+            pool_shard,
+            now_hour,
+            force_flush: level == LogLevel::Fatal,
+            profile: profile_enabled.then(|| AsyncWriteFrontProfile {
+                format_ns,
+                enqueue_ns: 0,
+            }),
+        };
+
+        if let Err(cmd) = self.async_frontend.enqueue_write(cmd) {
+            self.async_frontend
+                .recycle_line_buffer(cmd.pool_shard, cmd.line);
+            self.write_async_line_inline(level, tag, file, func, line, msg, pid, tid, maintid);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_async_line_inline(
+        &self,
+        level: LogLevel,
+        tag: &str,
+        file: &str,
+        func: &str,
+        line: u32,
+        msg: &str,
+        pid: i64,
+        tid: i64,
+        maintid: i64,
+    ) {
+        let timestamp = std::time::SystemTime::now();
+        let now_hour = local_hour_from_timestamp(timestamp);
         let engine_epoch = self.engine.async_flush_epoch();
         let capacity = self.engine.buffer_capacity();
+        let profile_enabled = async_stage_profile_enabled();
 
-        let mut state_guard = self.async_state.lock().expect("async state lock poisoned");
-        let stale = state_guard
-            .as_ref()
-            .map(|s| s.flush_epoch != engine_epoch)
-            .unwrap_or(false);
-        if stale {
-            *state_guard = None;
-        }
-        if state_guard.is_none() {
-            *state_guard = self.new_async_pending_state(now_hour, engine_epoch);
-        }
-        let Some(state) = state_guard.as_mut() else {
-            return;
-        };
+        with_hot_path_scratch(|scratch| {
+            let total_begin = if profile_enabled {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            let mut stage = AsyncBuildStage::default();
 
-        let threshold =
-            capacity.saturating_mul(ASYNC_WARNING_THRESHOLD_NUM) / ASYNC_WARNING_THRESHOLD_DEN;
-        let current_len = HEADER_LEN + state.payload.len();
-        let input = if current_len >= threshold {
-            format!("[F][ sg_buffer_async.Length() >= BUFFER_BLOCK_LENTH*4/5, len: {current_len}\n")
-                .into_bytes()
-        } else {
-            line.into_bytes()
-        };
+            (|| {
+                let format_begin = if profile_enabled {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                self.format_record_line_into(
+                    &mut scratch.line,
+                    level,
+                    tag,
+                    file,
+                    func,
+                    line,
+                    msg,
+                    pid,
+                    tid,
+                    maintid,
+                    timestamp,
+                );
+                if let Some(begin) = format_begin {
+                    stage.format_ns = begin.elapsed().as_nanos() as u64;
+                }
 
-        state.header.end_hour = now_hour;
-        if !state.append_chunk(&input, &self.cipher) {
-            *state_guard = None;
-            return;
-        }
-        let Some(pending) = state.pending_bytes_without_tailer() else {
-            *state_guard = None;
-            return;
-        };
+                let checkout_begin = if profile_enabled {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                let mut checked_out = self.checkout_async_state(profile_enabled);
+                if let Some(begin) = checkout_begin {
+                    stage.checkout_ns = begin.elapsed().as_nanos() as u64;
+                }
+                stage.checkout_lock_ns = checked_out.checkout_lock_ns();
+                stage.checkout_wait_ns = checked_out.checkout_wait_ns();
+                let stale = checked_out
+                    .pending()
+                    .map(|s| s.flush_epoch != engine_epoch)
+                    .unwrap_or(false);
+                if stale {
+                    checked_out.set_pending(None);
+                }
+                if checked_out.pending().is_none() {
+                    let Some(new_state) = self.new_async_pending_state(now_hour, engine_epoch)
+                    else {
+                        return;
+                    };
+                    let begin_pending_begin = if profile_enabled {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    if self.engine.begin_async_pending(&new_state.header).is_err() {
+                        return;
+                    }
+                    if let Some(begin) = begin_pending_begin {
+                        stage.begin_pending_ns = begin.elapsed().as_nanos() as u64;
+                    }
+                    checked_out.set_pending(Some(new_state));
+                }
+                let Some(state) = checked_out.pending_mut() else {
+                    return;
+                };
 
-        if self
-            .engine
-            .write_async_pending(&pending, level == LogLevel::Fatal)
-            .is_err()
-        {
-            if let Some(block) = state_guard.take().and_then(|s| s.finalize(&self.cipher)) {
-                self.persist_finalized_async_block(&block, level == LogLevel::Fatal);
-                let _ = self.engine.flush(true);
+                let threshold = capacity.saturating_mul(ASYNC_WARNING_THRESHOLD_NUM)
+                    / ASYNC_WARNING_THRESHOLD_DEN;
+                let current_len = HEADER_LEN + state.payload_len;
+                if current_len >= threshold {
+                    scratch.line.clear();
+                    let _ = write!(
+                        scratch.line,
+                        "[F][ sg_buffer_async.Length() >= BUFFER_BLOCK_LENTH*4/5, len: {current_len}\n"
+                    );
+                }
+
+                state.header.end_hour = now_hour;
+                let append_begin = if profile_enabled {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                let appended = state.append_chunk(
+                    scratch.line.as_bytes(),
+                    &mut scratch.compress,
+                    &mut scratch.crypto,
+                    &self.cipher,
+                    &self.engine,
+                    now_hour,
+                    level == LogLevel::Fatal,
+                );
+                if let Some(begin) = append_begin {
+                    stage.append_ns = begin.elapsed().as_nanos() as u64;
+                }
+                if !appended {
+                    checked_out.set_pending(None);
+                    drop(checked_out);
+                    let force_flush_begin = if profile_enabled {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    let _ = self.engine.flush(true);
+                    if let Some(begin) = force_flush_begin {
+                        stage.force_flush_ns = begin.elapsed().as_nanos() as u64;
+                    }
+                }
+            })();
+
+            if let Some(begin) = total_begin {
+                record_async_stage_sample(AsyncStageSample {
+                    total_ns: begin.elapsed().as_nanos() as u64,
+                    format_ns: stage.format_ns,
+                    checkout_ns: stage.checkout_ns,
+                    checkout_lock_ns: stage.checkout_lock_ns,
+                    checkout_wait_ns: stage.checkout_wait_ns,
+                    begin_pending_ns: stage.begin_pending_ns,
+                    append_ns: stage.append_ns,
+                    force_flush_ns: stage.force_flush_ns,
+                });
             }
-        }
+        });
     }
 
     fn finalize_async_pending(&self) {
-        let pending_block = {
-            let mut state_guard = self.async_state.lock().expect("async state lock poisoned");
-            state_guard.take().and_then(|s| s.finalize(&self.cipher))
-        };
-        if let Some(block) = pending_block {
-            self.persist_finalized_async_block(&block, false);
-        }
-    }
-
-    fn persist_finalized_async_block(&self, block: &[u8], force_flush: bool) {
-        match self.engine.write_async_pending(block, force_flush) {
-            Ok(()) => {}
-            Err(AppenderEngineError::InvalidMode) => {
-                if self.engine.write_block(block, force_flush).is_err() {
-                    let _ = self.engine.flush(true);
-                }
+        let now_hour = local_hour_from_timestamp(std::time::SystemTime::now());
+        with_hot_path_scratch(|scratch| {
+            let mut checked_out = self.checkout_async_state(false);
+            let Some(state) = checked_out.pending_mut() else {
+                return;
+            };
+            let finalized = state.finalize(
+                &mut scratch.compress,
+                &mut scratch.crypto,
+                &self.cipher,
+                &self.engine,
+                now_hour,
+                false,
+            );
+            checked_out.set_pending(None);
+            let needs_force_flush = !finalized && self.engine.mode() == EngineMode::Async;
+            drop(checked_out);
+            if needs_force_flush {
+                let _ = self.engine.flush(true);
             }
-            Err(_) => {
-                if self.engine.write_block(block, force_flush).is_err() {
-                    let _ = self.engine.flush(true);
-                }
-            }
-        }
+        });
     }
 
     fn make_logfile_name_impl(&self, timespan: i32, prefix: &str) -> Vec<String> {
@@ -727,14 +2040,31 @@ impl XlogBackend for RustBackend {
     }
 
     fn set_appender_mode(&self, mode: AppenderMode) {
-        if mode == AppenderMode::Sync && self.engine.mode() == EngineMode::Async {
-            self.finalize_async_pending();
+        let current = self.engine.mode();
+        match (current, mode) {
+            (EngineMode::Async, AppenderMode::Sync) => {
+                self.async_frontend.set_accepting(false);
+                let _ = self.async_frontend.request_flush(true);
+                self.finalize_async_pending();
+                let _ = self.engine.set_mode(EngineMode::Sync);
+            }
+            (EngineMode::Sync, AppenderMode::Async) => {
+                let _ = self.engine.set_mode(EngineMode::Async);
+                self.async_frontend.set_accepting(true);
+            }
+            _ => {
+                let _ = self.engine.set_mode(appender_to_engine_mode(mode));
+                self.async_frontend
+                    .set_accepting(mode == AppenderMode::Async);
+            }
         }
-        let _ = self.engine.set_mode(appender_to_engine_mode(mode));
     }
 
     fn flush(&self, sync: bool) {
         if self.engine.mode() == EngineMode::Async {
+            if self.async_frontend.request_flush(sync) {
+                return;
+            }
             self.finalize_async_pending();
         }
         let _ = self.engine.flush(sync);
@@ -779,6 +2109,12 @@ impl XlogBackend for RustBackend {
     }
 }
 
+impl Drop for RustBackend {
+    fn drop(&mut self) {
+        self.async_frontend.shutdown();
+    }
+}
+
 fn level_to_i32(level: LogLevel) -> i32 {
     match level {
         LogLevel::Verbose => 0,
@@ -819,13 +2155,6 @@ fn appender_to_engine_mode(mode: AppenderMode) -> EngineMode {
     match mode {
         AppenderMode::Async => EngineMode::Async,
         AppenderMode::Sync => EngineMode::Sync,
-    }
-}
-
-fn engine_to_appender_mode(mode: EngineMode) -> AppenderMode {
-    match mode {
-        EngineMode::Async => AppenderMode::Async,
-        EngineMode::Sync => AppenderMode::Sync,
     }
 }
 
@@ -1009,19 +2338,25 @@ mod tests {
             .pub_key(TEST_SERVER_PUBKEY_HEX);
         let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
 
-        let block = backend
-            .build_block(
-                LogLevel::Info,
-                "tag",
-                "main.rs",
-                "f",
-                7,
-                "plain-sync",
-                std::process::id() as i64,
-                super::current_tid(),
-                super::main_tid(),
-            )
-            .unwrap();
+        let block = super::with_hot_path_scratch(|scratch| {
+            backend
+                .build_sync_block_into(
+                    scratch,
+                    LogLevel::Info,
+                    "tag",
+                    "main.rs",
+                    "f",
+                    7,
+                    "plain-sync",
+                    std::process::id() as i64,
+                    super::current_tid(),
+                    super::main_tid(),
+                    std::time::SystemTime::now(),
+                    None,
+                )
+                .unwrap()
+                .to_vec()
+        });
         let (header, payload) = parse_block_payload(&block);
         assert_eq!(header.magic, MAGIC_SYNC_ZLIB_START);
         assert_ne!(header.client_pubkey, [0; 64]);
@@ -1041,19 +2376,25 @@ mod tests {
         let cfg = XlogConfig::new(root.to_string_lossy().to_string(), "demo-maintid")
             .mode(AppenderMode::Sync);
         let backend = RustBackend::new(cfg, LogLevel::Info).unwrap();
-        let block = backend
-            .build_block(
-                LogLevel::Info,
-                "tag",
-                "main.rs",
-                "f",
-                9,
-                "maintid",
-                std::process::id() as i64,
-                super::current_tid(),
-                super::main_tid(),
-            )
-            .unwrap();
+        let block = super::with_hot_path_scratch(|scratch| {
+            backend
+                .build_sync_block_into(
+                    scratch,
+                    LogLevel::Info,
+                    "tag",
+                    "main.rs",
+                    "f",
+                    9,
+                    "maintid",
+                    std::process::id() as i64,
+                    super::current_tid(),
+                    super::main_tid(),
+                    std::time::SystemTime::now(),
+                    None,
+                )
+                .unwrap()
+                .to_vec()
+        });
         let (_header, payload) = parse_block_payload(&block);
         let line = std::str::from_utf8(payload).unwrap();
 
@@ -1376,10 +2717,9 @@ mod tests {
                 .lock()
                 .expect("async state lock poisoned");
             let mut state = backend.new_async_pending_state(1, engine_epoch).unwrap();
-            while HEADER_LEN + state.payload.len() < threshold {
-                assert!(state.append_chunk(b"fill", &backend.cipher));
-            }
-            *guard = Some(state);
+            backend.engine.begin_async_pending(&state.header).unwrap();
+            state.payload_len = threshold.saturating_sub(HEADER_LEN);
+            guard.pending = Some(state);
         }
 
         backend.write_async_line(
@@ -1394,16 +2734,7 @@ mod tests {
             super::main_tid(),
         );
 
-        let pending = {
-            let guard = backend
-                .async_state
-                .lock()
-                .expect("async state lock poisoned");
-            guard
-                .as_ref()
-                .and_then(|s| s.pending_bytes_without_tailer())
-                .unwrap()
-        };
+        let pending = backend.engine.async_buffer_snapshot().unwrap();
         let header = LogHeader::decode(&pending[..HEADER_LEN]).unwrap();
         let payload = &pending[HEADER_LEN..];
         let plain = decode_block_payload(&header, payload);

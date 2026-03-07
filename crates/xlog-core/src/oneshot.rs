@@ -1,9 +1,9 @@
 use std::fs::File;
-use std::io::Read;
 
 use chrono::{Local, Timelike};
+use memmap2::MmapOptions;
 
-use crate::buffer::recover_blocks;
+use crate::buffer::scan_recovery;
 use crate::file_manager::FileManager;
 use crate::platform_tid::current_tid;
 use crate::protocol::{
@@ -35,23 +35,30 @@ pub fn oneshot_flush(
         return FileIoAction::Unnecessary;
     }
 
-    let mut f = match File::open(&mmap_path) {
+    let f = match File::open(&mmap_path) {
         Ok(f) => f,
         Err(_) => return FileIoAction::OpenFailed,
     };
 
-    let mut data = vec![0u8; mmap_capacity];
-    if f.read_exact(&mut data).is_err() {
+    let mmap_len = match f.metadata() {
+        Ok(meta) => meta.len() as usize,
+        Err(_) => return FileIoAction::ReadFailed,
+    };
+    if mmap_len != mmap_capacity {
         return FileIoAction::ReadFailed;
     }
+    let data = match unsafe { MmapOptions::new().len(mmap_capacity).map(&f) } {
+        Ok(mapped) => mapped,
+        Err(_) => return FileIoAction::ReadFailed,
+    };
 
-    let recovered = recover_blocks(&data);
-    if recovered.bytes.is_empty() {
+    let scan = scan_recovery(&data);
+    if scan.valid_len == 0 {
         return FileIoAction::Unnecessary;
     }
 
-    let sample_header = if recovered.bytes.len() >= HEADER_LEN {
-        LogHeader::decode(&recovered.bytes[..HEADER_LEN]).ok()
+    let sample_header = if scan.valid_len >= HEADER_LEN {
+        LogHeader::decode(&data[..HEADER_LEN]).ok()
     } else {
         None
     };
@@ -60,15 +67,27 @@ pub fn oneshot_flush(
         "~~~~~ begin of mmap from other process ~~~~~\n",
     ) {
         if file_manager
-            .append_log_bytes(&begin, max_file_size, false)
+            .append_log_bytes(&begin, max_file_size, false, false)
             .is_err()
         {
             return FileIoAction::WriteFailed;
         }
     }
 
-    if file_manager
-        .append_log_bytes(&recovered.bytes, max_file_size, false)
+    if scan.recovered_pending_block {
+        // Keep the recovered block contiguous so another process cannot
+        // interleave between payload bytes and the repaired tail marker.
+        let mut recovered = Vec::with_capacity(scan.valid_len.saturating_add(1));
+        recovered.extend_from_slice(&data[..scan.valid_len]);
+        recovered.push(MAGIC_END);
+        if file_manager
+            .append_log_bytes(&recovered, max_file_size, false, false)
+            .is_err()
+        {
+            return FileIoAction::WriteFailed;
+        }
+    } else if file_manager
+        .append_log_bytes(&data[..scan.valid_len], max_file_size, false, false)
         .is_err()
     {
         return FileIoAction::WriteFailed;
@@ -79,13 +98,14 @@ pub fn oneshot_flush(
     );
     if let Some(end) = build_sync_tip_block(sample_header, &end_tip) {
         if file_manager
-            .append_log_bytes(&end, max_file_size, false)
+            .append_log_bytes(&end, max_file_size, false, false)
             .is_err()
         {
             return FileIoAction::WriteFailed;
         }
     }
 
+    drop(data);
     if std::fs::remove_file(&mmap_path).is_err() {
         return FileIoAction::RemoveFailed;
     }

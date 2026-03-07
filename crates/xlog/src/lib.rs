@@ -95,6 +95,44 @@ pub struct RawLogMeta {
     pub trace_log: bool,
 }
 
+/// Stage-level latency summary used by Rust backend sync profiling.
+#[derive(Debug, Clone, Default)]
+pub struct StageLatencyStats {
+    pub avg_ns: f64,
+    pub p50_ns: u64,
+    pub p95_ns: u64,
+    pub p99_ns: u64,
+    pub max_ns: u64,
+}
+
+/// Aggregated sync hot-path stage stats for Rust backend.
+#[derive(Debug, Clone, Default)]
+pub struct RustSyncStageStats {
+    pub samples: usize,
+    pub total: StageLatencyStats,
+    pub format: StageLatencyStats,
+    pub block: StageLatencyStats,
+    pub engine_write: StageLatencyStats,
+}
+
+/// Aggregated async hot-path stage stats for Rust backend.
+#[derive(Debug, Clone, Default)]
+pub struct RustAsyncStageStats {
+    pub samples: usize,
+    pub total: StageLatencyStats,
+    pub format: StageLatencyStats,
+    pub checkout: StageLatencyStats,
+    pub checkout_lock: StageLatencyStats,
+    pub checkout_wait: StageLatencyStats,
+    pub begin_pending: StageLatencyStats,
+    pub append: StageLatencyStats,
+    pub force_flush: StageLatencyStats,
+    pub queue_full_count: u64,
+    pub block_send_count: u64,
+    pub block_send_ns: u64,
+    pub queue_depth_high_watermark: u64,
+}
+
 impl Default for RawLogMeta {
     fn default() -> Self {
         Self {
@@ -445,6 +483,38 @@ impl Xlog {
     pub fn memory_dump(buffer: &[u8]) -> String {
         backend::provider().memory_dump(buffer)
     }
+}
+
+/// Enable or disable Rust backend sync stage profiling.
+///
+/// When enabled, each sync write records stage timing for:
+/// `format -> block build -> engine write`.
+/// Use [`take_rust_sync_stage_stats`] to consume aggregated results.
+pub fn set_rust_sync_stage_profile_enabled(enabled: bool) {
+    backend::set_rust_sync_stage_profile_enabled(enabled);
+}
+
+/// Enable or disable Rust backend async stage profiling.
+///
+/// When enabled, each async write records stage timing for:
+/// `format -> checkout -> begin_pending -> append -> force_flush`.
+/// Use [`take_rust_async_stage_stats`] to consume aggregated results.
+pub fn set_rust_async_stage_profile_enabled(enabled: bool) {
+    backend::set_rust_async_stage_profile_enabled(enabled);
+}
+
+/// Consume Rust backend sync stage profiling stats.
+///
+/// Returns `None` if profiling is disabled or no samples were recorded.
+pub fn take_rust_sync_stage_stats() -> Option<RustSyncStageStats> {
+    backend::take_rust_sync_stage_stats()
+}
+
+/// Consume Rust backend async stage profiling stats.
+///
+/// Returns `None` if profiling is disabled or no samples were recorded.
+pub fn take_rust_async_stage_stats() -> Option<RustAsyncStageStats> {
+    backend::take_rust_async_stage_stats()
 }
 
 #[cfg(any(
