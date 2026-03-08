@@ -486,6 +486,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bench_append_path_variant(
     variant: &str,
     opts: &Options,
@@ -553,7 +554,7 @@ fn bench_move_old_cache_files_variant(opts: &Options, payload: &[u8]) -> Result<
     )
     .map_err(|e| format!("{variant} file manager init: {e}"))?;
 
-    let rounds = opts.io_iterations.min(1_000).max(1);
+    let rounds = opts.io_iterations.clamp(1, 1_000);
     let mut input_bytes = 0usize;
     let (start, start_res) = begin_measurement();
     for idx in 0..rounds {
@@ -604,7 +605,7 @@ fn bench_move_old_cache_files_only_variant(opts: &Options, payload: &[u8]) -> Re
     )
     .map_err(|e| format!("{variant} file manager init: {e}"))?;
 
-    let seed_files = opts.io_iterations.min(2_000).max(1);
+    let seed_files = opts.io_iterations.clamp(1, 2_000);
     for idx in 0..seed_files {
         let path = cache_dir.join(format!("bench-move-only-{idx}.xlog"));
         create_old_file(&path, payload, variant)?;
@@ -661,7 +662,7 @@ fn bench_flush_append_only_variant(opts: &Options, payload: &[u8]) -> Result<(),
     )
     .map_err(|e| format!("{variant} file manager init: {e}"))?;
 
-    let rounds = opts.io_iterations.min(2_000).max(1);
+    let rounds = opts.io_iterations.clamp(1, 2_000);
     let max_file_size = (payload.len().max(64) as u64).saturating_mul(1024 * 1024);
     let (start, start_res) = begin_measurement();
     for _ in 0..rounds {
@@ -711,7 +712,7 @@ fn bench_flush_sweep_only_variant(opts: &Options, payload: &[u8]) -> Result<(), 
     )
     .map_err(|e| format!("{variant} file manager init: {e}"))?;
 
-    let rounds = opts.io_iterations.min(1_000).max(1);
+    let rounds = opts.io_iterations.clamp(1, 1_000);
     let max_file_size = (payload.len().max(64) as u64).saturating_mul(1024 * 1024);
     for _ in 0..rounds {
         manager
@@ -766,7 +767,7 @@ fn bench_flush_via_delete_expired_variant(opts: &Options, payload: &[u8]) -> Res
     )
     .map_err(|e| format!("{variant} file manager init: {e}"))?;
 
-    let rounds = opts.io_iterations.min(1_000).max(1);
+    let rounds = opts.io_iterations.clamp(1, 1_000);
     let max_file_size = (payload.len().max(64) as u64).saturating_mul(1024 * 1024);
     let (start, start_res) = begin_measurement();
     for _ in 0..rounds {
@@ -818,7 +819,7 @@ fn bench_delete_expired_scan_only_variant(opts: &Options, payload: &[u8]) -> Res
     )
     .map_err(|e| format!("{variant} file manager init: {e}"))?;
 
-    let seed_files = opts.io_iterations.min(2_000).max(1);
+    let seed_files = opts.io_iterations.clamp(1, 2_000);
     for idx in 0..seed_files {
         let log_path = log_dir.join(format!("bench-fresh-log-{idx}.xlog"));
         let cache_path = cache_dir.join(format!("bench-fresh-cache-{idx}.xlog"));
@@ -878,7 +879,7 @@ fn bench_delete_expired_files_variant(opts: &Options, payload: &[u8]) -> Result<
     )
     .map_err(|e| format!("{variant} file manager init: {e}"))?;
 
-    let seed_files = opts.io_iterations.min(512).max(1);
+    let seed_files = opts.io_iterations.clamp(1, 512);
     for idx in 0..seed_files {
         let log_path = log_dir.join(format!("bench-expired-log-{idx}.xlog"));
         let cache_path = cache_dir.join(format!("bench-expired-cache-{idx}.xlog"));
@@ -1096,6 +1097,7 @@ fn capture_proc_io_snapshot() -> Option<ProcIoSnapshot> {
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_result(
     component: &str,
     variant: &str,

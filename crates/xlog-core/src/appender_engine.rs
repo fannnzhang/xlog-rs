@@ -179,16 +179,16 @@ impl AppenderEngine {
         let worker = thread::Builder::new()
             .name("xlog-appender-engine".to_string())
             .spawn(move || {
-                run_worker_loop(
-                    worker_state,
+                run_worker_loop(WorkerLoopCtx {
+                    state: worker_state,
                     rx,
-                    worker_tx,
-                    worker_pending_flag,
-                    worker_flush_epoch,
-                    worker_flush_reason,
-                    worker_flush_requeue_count,
+                    tx: worker_tx,
+                    pending_async_flush: worker_pending_flag,
+                    async_flush_epoch: worker_flush_epoch,
+                    async_flush_reason: worker_flush_reason,
+                    async_flush_requeue_count: worker_flush_requeue_count,
                     flush_timeout,
-                )
+                })
             })
             .expect("spawn appender engine thread");
 
@@ -596,7 +596,7 @@ impl Drop for AppenderEngine {
     }
 }
 
-fn run_worker_loop(
+struct WorkerLoopCtx {
     state: Arc<Mutex<EngineState>>,
     rx: Receiver<EngineCommand>,
     tx: Sender<EngineCommand>,
@@ -605,7 +605,19 @@ fn run_worker_loop(
     async_flush_reason: Arc<AtomicU8>,
     async_flush_requeue_count: Arc<AtomicU64>,
     flush_timeout: Duration,
-) {
+}
+
+fn run_worker_loop(ctx: WorkerLoopCtx) {
+    let WorkerLoopCtx {
+        state,
+        rx,
+        tx,
+        pending_async_flush,
+        async_flush_epoch,
+        async_flush_reason,
+        async_flush_requeue_count,
+        flush_timeout,
+    } = ctx;
     let poll_interval = flush_timeout.min(EXPIRED_SWEEP_INTERVAL);
     loop {
         match rx.recv_timeout(poll_interval) {

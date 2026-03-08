@@ -180,7 +180,6 @@ pub fn write_console_line(
             unsafe {
                 xlog_core_apple_console_printf(c_line.as_ptr());
             }
-            return;
         }
 
         #[cfg(not(any(

@@ -73,9 +73,9 @@ impl EcdhTeaCipher {
         let shared_bytes = shared.raw_secret_bytes();
 
         let mut tea_key = [0u32; 4];
-        for i in 0..4 {
+        for (i, word) in tea_key.iter_mut().enumerate() {
             let start = i * 4;
-            tea_key[i] = u32::from_le_bytes([
+            *word = u32::from_le_bytes([
                 shared_bytes[start],
                 shared_bytes[start + 1],
                 shared_bytes[start + 2],

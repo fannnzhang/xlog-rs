@@ -25,7 +25,7 @@ fn make_block(seq: u16, payload: &[u8]) -> Vec<u8> {
 fn parse_payloads(buf: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut offset = 0usize;
-    while offset + HEADER_LEN + 1 <= buf.len() {
+    while offset + HEADER_LEN < buf.len() {
         let Ok(header) = LogHeader::decode(&buf[offset..offset + HEADER_LEN]) else {
             break;
         };

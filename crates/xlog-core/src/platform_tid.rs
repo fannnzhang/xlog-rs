@@ -53,7 +53,7 @@ pub fn main_tid() -> i64 {
     ))]
     {
         static MAIN_TID: OnceLock<i64> = OnceLock::new();
-        return *MAIN_TID.get_or_init(current_tid);
+        *MAIN_TID.get_or_init(current_tid)
     }
 
     #[cfg(not(any(

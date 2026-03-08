@@ -208,6 +208,7 @@ impl Drop for CheckedOutAsyncState<'_> {
 }
 
 impl AsyncPendingState {
+    #[allow(clippy::too_many_arguments)]
     fn append_chunk(
         &mut self,
         chunk: &[u8],
@@ -405,11 +406,11 @@ struct HourCache {
 }
 
 thread_local! {
-    static HOUR_CACHE: RefCell<HourCache> = RefCell::new(HourCache {
+    static HOUR_CACHE: RefCell<HourCache> = const { RefCell::new(HourCache {
         epoch_second: 0,
         hour: 0,
         valid: false,
-    });
+    }) };
 }
 
 #[cfg(feature = "bench-internals")]
@@ -1202,6 +1203,7 @@ impl RustBackend {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_sync_block_into<'a>(
         &self,
         scratch: &'a mut HotPathScratch,
@@ -1266,6 +1268,7 @@ impl RustBackend {
         Some(scratch.block.as_slice())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn format_record_line_into(
         &self,
         out: &mut String,
@@ -1331,6 +1334,7 @@ impl RustBackend {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_with_meta_internal(
         &self,
         level: LogLevel,
@@ -1410,6 +1414,7 @@ impl RustBackend {
         new_async_pending_state_for(&self.config, &self.cipher, hour, flush_epoch)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_async_line(
         &self,
         level: LogLevel,
@@ -1464,7 +1469,7 @@ impl RustBackend {
             pool_shard,
             now_hour,
             force_flush: level == LogLevel::Fatal,
-            profile: profile_enabled.then(|| AsyncWriteFrontProfile {
+            profile: profile_enabled.then_some(AsyncWriteFrontProfile {
                 format_ns,
                 enqueue_ns: 0,
             }),
@@ -1570,9 +1575,9 @@ impl RustBackend {
                 let current_len = HEADER_LEN + state.payload_len;
                 if current_len >= threshold {
                     scratch.line.clear();
-                    let _ = write!(
+                    let _ = writeln!(
                         scratch.line,
-                        "[F][ sg_buffer_async.Length() >= BUFFER_BLOCK_LENTH*4/5, len: {current_len}\n"
+                        "[F][ sg_buffer_async.Length() >= BUFFER_BLOCK_LENTH*4/5, len: {current_len}"
                     );
                 }
 

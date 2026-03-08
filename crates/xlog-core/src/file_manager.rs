@@ -1071,7 +1071,7 @@ fn file_index_from_path(path: &Path, prefix: &str) -> Option<i64> {
 }
 
 fn day_key(now: chrono::DateTime<Local>) -> i32 {
-    (now.year() as i32) * 10_000 + (now.month() as i32) * 100 + now.day() as i32
+    now.year() * 10_000 + (now.month() as i32) * 100 + now.day() as i32
 }
 
 fn append_file_to_file(src: &Path, dst: &Path) -> Result<(), FileManagerError> {
@@ -1284,12 +1284,12 @@ fn rollback_file_to_len(file: &mut File, target_len: u64) {
     let _ = file.seek(SeekFrom::Start(target_len));
 }
 
-fn open_append_file(path: &Path, path_buf: &PathBuf) -> Result<File, FileManagerError> {
+fn open_append_file(path: &Path, path_buf: &Path) -> Result<File, FileManagerError> {
     match OpenOptions::new().create(true).append(true).open(path) {
         Ok(file) => Ok(file),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let Some(parent) = path.parent() else {
-                return Err(FileManagerError::OpenFile(path_buf.clone(), err));
+                return Err(FileManagerError::OpenFile(path_buf.to_path_buf(), err));
             };
             fs::create_dir_all(parent)
                 .map_err(|e| FileManagerError::CreateDir(parent.to_path_buf(), e))?;
@@ -1297,9 +1297,9 @@ fn open_append_file(path: &Path, path_buf: &PathBuf) -> Result<File, FileManager
                 .create(true)
                 .append(true)
                 .open(path)
-                .map_err(|e| FileManagerError::OpenFile(path_buf.clone(), e))
+                .map_err(|e| FileManagerError::OpenFile(path_buf.to_path_buf(), e))
         }
-        Err(err) => Err(FileManagerError::OpenFile(path_buf.clone(), err)),
+        Err(err) => Err(FileManagerError::OpenFile(path_buf.to_path_buf(), err)),
     }
 }
 

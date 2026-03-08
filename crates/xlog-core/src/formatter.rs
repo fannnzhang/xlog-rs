@@ -19,11 +19,11 @@ struct TimePrefixCache {
 }
 
 thread_local! {
-    static TIME_PREFIX_CACHE: RefCell<TimePrefixCache> = RefCell::new(TimePrefixCache {
+    static TIME_PREFIX_CACHE: RefCell<TimePrefixCache> = const { RefCell::new(TimePrefixCache {
         epoch_second: 0,
         prefix: String::new(),
         valid: false,
-    });
+    }) };
 }
 
 /// Returns the last path component from a full source path.
@@ -126,6 +126,7 @@ pub fn format_record_into(out: &mut String, record: &LogRecord, body: &str) {
 ///
 /// The output matches the legacy xlog single-line text formatter and truncates the
 /// body to the legacy size limits without splitting UTF-8 code points.
+#[allow(clippy::too_many_arguments)]
 pub fn format_record_parts_into(
     out: &mut String,
     level: crate::record::LogLevel,

@@ -390,6 +390,7 @@ impl Xlog {
     ///
     /// This is mainly for low-level platform wrappers that already own thread
     /// metadata (for example JNI side thread ids).
+    #[allow(clippy::too_many_arguments)]
     pub fn write_with_meta_raw(
         &self,
         level: LogLevel,

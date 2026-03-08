@@ -3,7 +3,9 @@ use std::sync::Arc;
 use crate::{AppenderMode, FileIoAction, LogLevel, RawLogMeta, XlogConfig, XlogError};
 
 #[cfg(not(feature = "rust-backend"))]
-compile_error!("mars-xlog requires the `rust-backend` feature; the C++ backend is repository-local only");
+compile_error!(
+    "mars-xlog requires the `rust-backend` feature; the C++ backend is repository-local only"
+);
 
 #[cfg(any(
     target_os = "ios",
@@ -26,6 +28,7 @@ pub(crate) trait XlogBackend: Send + Sync {
     fn set_console_log_open(&self, open: bool);
     fn set_max_file_size(&self, max_bytes: i64);
     fn set_max_alive_time(&self, alive_seconds: i64);
+    #[allow(clippy::too_many_arguments)]
     fn write_with_meta(
         &self,
         level: LogLevel,
@@ -51,6 +54,7 @@ pub(crate) trait XlogBackendProvider: Send + Sync {
     fn appender_close(&self);
     fn flush_all(&self, sync: bool);
     fn global_is_enabled(&self, level: LogLevel) -> bool;
+    #[allow(clippy::too_many_arguments)]
     fn write_global_with_meta(
         &self,
         level: LogLevel,

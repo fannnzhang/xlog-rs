@@ -92,6 +92,11 @@ impl MmapStore {
         self.mmap.len()
     }
 
+    /// Return `true` when the mmap length is zero.
+    pub fn is_empty(&self) -> bool {
+        self.mmap.is_empty()
+    }
+
     /// Borrow the full mmap as an immutable byte slice.
     pub fn as_slice(&self) -> &[u8] {
         &self.mmap
@@ -115,6 +120,7 @@ fn open_rw_file(path: &Path) -> Result<File, MmapStoreError> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(path)
         .map_err(|e| MmapStoreError::OpenFile(path.to_path_buf(), e))
 }
