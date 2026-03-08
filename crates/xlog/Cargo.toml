@@ -3,6 +3,20 @@ name = "mars-xlog"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "Pure Rust xlog library with async/sync appenders, compression, encryption, and tracing integration."
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/mars-xlog"
+keywords = ["logging", "xlog", "tracing", "mobile", "rust"]
+categories = ["development-tools::debugging", "api-bindings"]
+exclude = [
+    "benches/**",
+    "examples/bench_backend.rs",
+    "examples/gen_fixture.rs",
+]
 
 [lib]
 crate-type = ["rlib"]
@@ -37,3 +51,7 @@ tempfile = "3"
 [[bench]]
 name = "criterion_write_path"
 harness = false
+
+[package.metadata.docs.rs]
+features = ["macros", "tracing"]
+no-default-features = false

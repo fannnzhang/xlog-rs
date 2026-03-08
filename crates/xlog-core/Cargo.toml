@@ -3,6 +3,19 @@ name = "mars-xlog-core"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "Core runtime building blocks for the Rust-native xlog engine."
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/mars-xlog-core"
+keywords = ["logging", "xlog", "compression", "crypto", "mmap"]
+categories = ["development-tools::debugging"]
+exclude = [
+    "benches/**",
+    "examples/**",
+]
 
 [lib]
 crate-type = ["rlib"]
@@ -32,3 +45,6 @@ harness = false
 
 [build-dependencies]
 cc = "1"
+
+[package.metadata.docs.rs]
+no-default-features = false

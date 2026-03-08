@@ -1,8 +1,9 @@
 //! Safe Rust wrapper for the Tencent Mars Xlog logging library.
 //!
-//! This crate owns the high-level API used by the platform bindings. It wraps
-//! the raw FFI in `mars-xlog-sys` and provides an ergonomic `Xlog` handle plus
-//! helpers for `tracing`.
+//! This crate owns the high-level Rust API used by platform bindings and
+//! direct Rust integrations. The default release surface is pure Rust and
+//! built on top of `mars-xlog-core`; benchmark-only hooks stay feature-gated
+//! and out of the default public API.
 //!
 //! # Quick start
 //! ```
@@ -35,39 +36,58 @@ pub use tracing_layer::{XlogLayer, XlogLayerConfig, XlogLayerHandle};
 /// Log severity levels supported by Mars Xlog.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum LogLevel {
+    /// Verbose diagnostic output.
     Verbose,
+    /// Debug output for development and troubleshooting.
     Debug,
+    /// Informational output for normal events.
     Info,
+    /// Warning output for recoverable issues.
     Warn,
+    /// Error output for failures that do not immediately abort the process.
     Error,
+    /// Fatal output for unrecoverable failures.
     Fatal,
+    /// Logging disabled.
     None,
 }
 
 /// Controls whether logs are appended asynchronously or synchronously.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum AppenderMode {
+    /// Queue writes and persist them from the async worker path.
     Async,
+    /// Write through the sync path owned by the caller.
     Sync,
 }
 
 /// Compression algorithm used for log buffers/files.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum CompressMode {
+    /// Use zlib framing compatible with the historical xlog format.
     Zlib,
+    /// Use zstd framing supported by the Rust implementation.
     Zstd,
 }
 
 /// Result code returned by `Xlog::oneshot_flush`.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum FileIoAction {
+    /// No file action was taken.
     None,
+    /// The requested file action completed successfully.
     Success,
+    /// The requested file action was not needed.
     Unnecessary,
+    /// Opening the source or destination file failed.
     OpenFailed,
+    /// Reading a source file failed.
     ReadFailed,
+    /// Writing a destination file failed.
     WriteFailed,
+    /// Closing a file handle failed.
     CloseFailed,
+    /// Removing a source file failed.
     RemoveFailed,
 }
 
@@ -93,9 +113,13 @@ impl From<c_int> for FileIoAction {
 /// - `trace_log = true` enables Android console bypass behavior.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct RawLogMeta {
+    /// Process id override. Use `-1` to let the backend fill the runtime pid.
     pub pid: i64,
+    /// Thread id override. Use `-1` to let the backend fill the runtime tid.
     pub tid: i64,
+    /// Main thread id override. Use `-1` to let the backend fill the runtime value.
     pub maintid: i64,
+    /// Whether Android `traceLog` console bypass behavior should be enabled.
     pub trace_log: bool,
 }
 
@@ -132,8 +156,10 @@ impl RawLogMeta {
 #[derive(Debug, thiserror::Error)]
 pub enum XlogError {
     #[error("log_dir and name_prefix must be non-empty")]
+    /// Required config fields such as `log_dir` or `name_prefix` were empty.
     InvalidConfig,
     #[error("xlog initialization failed")]
+    /// Backend initialization failed.
     InitFailed,
 }
 
@@ -460,8 +486,11 @@ impl Xlog {
 #[doc(hidden)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ConsoleFun {
+    /// Forward console output through `printf`.
     Printf = 0,
+    /// Forward console output through `NSLog`.
     NSLog = 1,
+    /// Forward console output through `os_log`.
     OSLog = 2,
 }
 

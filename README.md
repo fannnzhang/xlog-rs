@@ -1,15 +1,21 @@
-# mars-xlog (Rust workspace)
+# xlog-rs
 
 This workspace provides a Rust-native implementation of Tencent Mars `xlog`, with optional legacy C/C++ FFI support kept for compatibility/testing.
+
+## Release surface
+
+- `mars-xlog` is the release-facing Rust crate and the intended Cargo entry point for Rust users.
+- `mars-xlog-core` is the implementation-layer crate used by `mars-xlog`.
+- `mars-xlog-sys` and the platform binding crates remain repository-local support crates and are not the primary Rust release surface.
 
 ## Migration status
 - Default runtime path is Rust (`mars-xlog-core` + `mars-xlog`); C++ build is no longer part of default workspace build.
 - UniFFI/JNI/Harmony wrappers are wired to the Rust backend by default.
 - `mars-xlog-sys` remains as a legacy crate for compatibility verification and reference.
 
-## Crates
+## Workspace crates
 - `mars-xlog-core`: Rust runtime core (protocol/compress/crypto/mmap/appender).
-- `mars-xlog`: safe Rust wrapper API (default Rust backend).
+- `mars-xlog`: safe Rust wrapper API and the default Rust integration surface.
 - `mars-xlog-uniffi`: minimal UniFFI surface (Kotlin/Swift friendly).
 - `mars-xlog-android-jni`: JNI bridge used by the Android example app.
 - `oh-xlog`: Harmony/ohos N-API bindings.

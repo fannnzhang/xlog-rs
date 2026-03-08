@@ -19,7 +19,10 @@ default-members = [
 [workspace.package]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/Tencent/mars"
+authors = ["xlog-rs contributors"]
+homepage = "https://github.com/fannnzhang/xlog-rs"
+repository = "https://github.com/fannnzhang/xlog-rs"
+rust-version = "1.92"
 
 [workspace.dependencies]
 libc = "0.2"

@@ -24,6 +24,8 @@ pub struct XlogLayerConfig {
 }
 
 impl XlogLayerConfig {
+    /// Create a layer config with `enabled = true`, no tag override, and
+    /// span names excluded from the formatted message.
     pub fn new(level: LogLevel) -> Self {
         Self {
             enabled: true,
@@ -33,21 +35,25 @@ impl XlogLayerConfig {
         }
     }
 
+    /// Enable or disable the layer.
     pub fn enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
         self
     }
 
+    /// Set the minimum forwarded log level.
     pub fn level(mut self, level: LogLevel) -> Self {
         self.level = level;
         self
     }
 
+    /// Override the emitted tag instead of using `Metadata::target()`.
     pub fn tag(mut self, tag: impl Into<String>) -> Self {
         self.tag = Some(tag.into());
         self
     }
 
+    /// Include the current span stack in the formatted message body.
     pub fn include_spans(mut self, include: bool) -> Self {
         self.include_spans = include;
         self
