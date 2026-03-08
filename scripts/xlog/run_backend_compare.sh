@@ -18,7 +18,7 @@ Usage:
   scripts/xlog/run_backend_compare.sh --out-root <dir> [options]
 
 Options:
-  --out-root <dir>        Output root for all benchmark artifacts (required)
+  --out-root <dir>        Output root for Rust benchmark artifacts (required)
   --messages <n>          Total messages per run (default: 20000)
   --mode <async|sync>     Appender mode (default: async)
   --compress <zlib|zstd>  Compression mode (default: zlib)
@@ -94,8 +94,7 @@ fi
 mkdir -p "$out_root"
 
 run_backend() {
-  local feature="$1"
-  local label="$2"
+  local label="$1"
   local results_file="$out_root/results_${label}_${mode}.jsonl"
   rm -f "$results_file"
 
@@ -106,7 +105,7 @@ run_backend() {
 
     local cmd=(
       cargo run --release -p mars-xlog --example bench_backend
-      --no-default-features --features "$feature" --
+      --no-default-features --features rust-backend --
       --out-dir "$run_dir"
       --prefix "${label}-${mode}"
       --messages "$messages"
@@ -126,5 +125,4 @@ run_backend() {
   done
 }
 
-run_backend rust-backend rust
-run_backend cpp-backend cpp
+run_backend rust

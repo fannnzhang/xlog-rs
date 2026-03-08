@@ -1008,7 +1008,6 @@ dependencies = [
  "crossbeam-queue",
  "libc",
  "mars-xlog-core",
- "mars-xlog-sys",
  "tempfile",
  "thiserror 1.0.69",
  "tracing",

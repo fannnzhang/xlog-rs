@@ -206,25 +206,6 @@ if [[ "$skip_bench" -eq 0 ]]; then
       echo "[phase5] metric rust: ${metric_line}" | tee -a "$summary_file"
     fi
   fi
-
-  run_step \
-    "bench_cpp" \
-    cargo run --release -p mars-xlog --example bench_backend --no-default-features --features cpp-backend -- \
-      --out-dir "${bench_dir}/cpp" \
-      --prefix "phase5-cpp" \
-      --messages "$messages" \
-      --mode "$mode" \
-      --compress "$compress" \
-      --threads "$threads" \
-      --flush-every "$flush_every"
-
-  if [[ "$last_exit_code" -eq 0 ]]; then
-    metric_line="$(grep -E '^\{.*"throughput_mps".*\}$' "${logs_dir}/bench_cpp.log" | tail -n 1 || true)"
-    if [[ -n "$metric_line" ]]; then
-      echo "$metric_line" >> "$metrics_file"
-      echo "[phase5] metric cpp: ${metric_line}" | tee -a "$summary_file"
-    fi
-  fi
 fi
 
 if [[ "$failures" -eq 0 ]]; then

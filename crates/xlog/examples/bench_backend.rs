@@ -1202,12 +1202,5 @@ fn dir_size(path: &Path) -> u64 {
 }
 
 fn backend_name() -> &'static str {
-    #[cfg(feature = "rust-backend")]
-    {
-        "rust"
-    }
-    #[cfg(feature = "cpp-backend")]
-    {
-        "cpp"
-    }
+    "rust"
 }

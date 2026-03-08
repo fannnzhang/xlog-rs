@@ -17,8 +17,8 @@
 1. 标准 Rust 微基准
    - `cargo bench -p mars-xlog-core --bench criterion_components`
    - `cargo bench -p mars-xlog --bench criterion_write_path`
-2. 端到端矩阵与跨后端对比
-   - `scripts/xlog/run_bench_matrix.sh --manifest scripts/xlog/bench_matrix.tsv --out-root <dir> --backends rust,cpp --runs 1 --components`
+2. Rust 端到端矩阵
+   - `scripts/xlog/run_bench_matrix.sh --manifest scripts/xlog/bench_matrix.tsv --out-root <dir> --backends rust --runs 1 --components`
 3. 需要更细归因时，再打开 feature-gated profile
    - `cargo run --release -p mars-xlog --example bench_backend --no-default-features --features rust-backend,bench-internals -- --out-dir <dir> --stage-profile ...`
 
@@ -31,7 +31,7 @@
    - `bench-internals` 下可输出 Rust sync/async stage profile
 2. `run_bench_matrix.sh`
    - manifest-driven 场景管理
-   - backend 顺序支持 `fixed / alternating / randomized`
+   - Rust-only backend 运行，顺序策略仍支持 `fixed / alternating / randomized`
    - 输出 `manifest.tsv / results_raw.jsonl / summary.md / summary.json / metadata.json / run.log`
 3. `criterion`
    - `criterion_components.rs`：formatter / compress encode / compress decode / crypto
@@ -50,6 +50,8 @@
 ## 3. 最新基线
 
 ### 3.1 双端全量矩阵（2026-03-08）
+
+这组 Rust/C++ 对比数据是剥离 `mars-xlog-sys` 前最后一轮统一矩阵快照，用于发布判断参考，不再作为当前维护态 runner 的默认输出。
 
 数据来源：
 
@@ -144,7 +146,7 @@
 
 ## 4. 当前仍未收口的 benchmark 缺口
 
-### 4.1 全量矩阵仍是单次运行
+### 4.1 历史双端矩阵仍是单次运行
 
 当前全量双端矩阵默认仍是 `runs=1`。
 
@@ -183,7 +185,7 @@
 2. 每块积累了多少行与多少字节
 3. `bytes/msg` 偏大更像是 block 聚合问题、压缩问题，还是 queue/backpressure 问题
 
-### 4.4 当前双端主差距已改写
+### 4.4 历史双端结论已收敛为发布参考
 
 以下旧判断已不再适合作为当前优化优先级：
 
@@ -254,8 +256,8 @@
    - `scripts/xlog/run_criterion_bench.sh --out-root artifacts/criterion/<run_name>`
 2. 需要阶段归因时
    - `cargo run --release -p mars-xlog --example bench_backend --no-default-features --features rust-backend,bench-internals -- --out-dir <dir> --stage-profile ...`
-3. 跑双端矩阵
-   - `scripts/xlog/run_bench_matrix.sh --manifest scripts/xlog/bench_matrix.tsv --out-root <current_root> --backends rust,cpp --runs 1 --components`
+3. 跑 Rust 矩阵
+   - `scripts/xlog/run_bench_matrix.sh --manifest scripts/xlog/bench_matrix.tsv --out-root <current_root> --backends rust --runs 1 --components`
 4. 单次分析
    - `python3 scripts/xlog/analyze_bench.py --root <current_root>`
 5. 回归判定
@@ -266,7 +268,7 @@
 
 已完成：
 
-1. manifest-driven 双端矩阵 runner
+1. manifest-driven Rust 矩阵 runner
 2. metadata / raw / summary / regression 产物治理
 3. payload profile 四分类
 4. baseline / stress / feature 矩阵拆分

@@ -20,7 +20,7 @@
 1. Rust 运行时迁移已经完成，`mars-xlog` 默认走 Rust backend。
 2. `xlog-core` 已覆盖协议、压缩、加密、mmap、文件管理、appender engine、dump 与 registry。
 3. JNI / UniFFI / Harmony NAPI 能力面已对齐当前 Rust API。
-4. `mars-xlog-sys` 与 C++ backend 仍保留，用作 benchmark / parity 基线。
+4. `mars-xlog-sys` 仍保留在仓库内作为 legacy 兼容性参考，但已从 `mars-xlog` 的公开发布面剥离。
 5. 当前主任务是“收口剩余语义红线 + 解释并优化 async 剩余差距”，不是继续补迁移功能。
 
 当前源码分层：
@@ -31,8 +31,9 @@ bindings (JNI / UniFFI / NAPI)
 crates/xlog
     ↓
 crates/xlog-core
-    ↓
-crates/xlog-sys + third_party/mars (仅用于 C++ backend 对照)
+
+legacy reference lane:
+crates/xlog-sys + third_party/mars
 ```
 
 ## 3. 后续优化必须满足的硬约束

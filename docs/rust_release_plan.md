@@ -6,7 +6,7 @@
 
 1. 以 Rust 实现为主，准备 `crates.io` 发布路径
 2. 对外发布不包含 C++ 版本的安装/默认依赖链
-3. 保留仓库内 C++ backend 作为 parity、benchmark 和兼容性参考，而不是发布主线
+3. 保留仓库内 legacy C++ 代码作为兼容性参考，而不是发布主线或 `mars-xlog` 依赖链
 
 非目标：
 
@@ -50,7 +50,7 @@
 
 如果未来要把整个发布对象进一步收敛成“单 package、无独立 core crate”的形态，那需要把 core 代码并入顶层 crate。这是单独的包结构重构，不应和本轮发布资料补齐混在一起。
 
-### 3.1 crates.io 发布拓扑尚未收口
+### 3.1 crates.io 发布拓扑已收口到纯 Rust，但仍有发布顺序要求
 
 当前 dry-run 结果：
 
@@ -61,18 +61,12 @@
    - 失败
    - 原因：`mars-xlog-core` 尚未存在于 crates.io
 
-再结合当前 manifest，可以确认另外一个结构性事实：
-
-1. `mars-xlog` 仍保留可选的 `mars-xlog-sys` 依赖和 `cpp-backend` feature
-2. 这与“公开发布面是纯 Rust”的目标不一致
-
-因此当前至少有三个事实：
+因此当前至少有两个事实：
 
 1. 发布顺序必须先解决 `mars-xlog-core`，再发布 `mars-xlog`
-2. `mars-xlog` 的 crates.io 拓扑还要继续收口，不能直接把当前 workspace 依赖关系视为最终发布形态
-3. 公开发布面的 C++ 依赖链还没有完全剥离
+2. `mars-xlog` 的 crates.io 拓扑已经收口为纯 Rust，但仍要按 crates.io 依赖顺序发布
 
-### 3.2 crate 元数据还不符合正式发布要求
+### 3.2 crate 元数据基础面已补齐
 
 这轮已经补齐发布对象的基础元数据：
 
@@ -87,7 +81,7 @@
 
 剩余工作不再是“有没有这些字段”，而是随着最终发布包名字和 docs.rs 地址定稿后，是否还需要做一次统一调整。
 
-### 3.3 发布范围还没定稿
+### 3.3 发布范围已定稿
 
 当前发布范围已经部分收口。
 
@@ -112,7 +106,7 @@
 当前状态：
 
 1. 上述非发布对象已经标记 `publish = false`
-2. 还需要继续收口的是 `mars-xlog` 本身的 manifest，不再携带对公开发布面无效的 C++ 依赖链
+2. `mars-xlog` 已不再携带 `mars-xlog-sys` 或 `cpp-backend` 到公开发布面
 
 原因：
 
@@ -128,8 +122,8 @@
 
 当前剩余问题：
 
-1. `mars-xlog` 的源包里仍包含 C++ backend 源码路径
-2. 这和纯 Rust 发布面的最终目标仍不一致
+1. 需要继续用 `cargo package --list` 和 dry-run 校验发布包内容
+2. 发布顺序仍要求先有 `mars-xlog-core`，再发布 `mars-xlog`
 
 ### 3.5 仍存在 1 个语义级阻断项
 
@@ -147,7 +141,7 @@
 
 1. 在 crates.io 上提供 Rust-only 可安装版本
 2. 对外 API、README、docs.rs 和基础示例可用
-3. 保持 C++ backend 在仓库内用于 benchmark / parity，而不是发布默认链路
+3. 保持 legacy C++ 代码只在仓库内存在，不再进入 `mars-xlog` 发布链路
 
 要求：
 
@@ -179,16 +173,16 @@
 必须先定：
 
 1. `mars-xlog-core` 是否作为公开依赖 crate 正式发布
-2. `mars-xlog` 的发布版是否完全去掉 `mars-xlog-sys` 的 crates.io 依赖链
+2. `mars-xlog` 是否保持当前纯 Rust 依赖拓扑
 3. 哪些 crate 显式加上 `publish = false`
 
 建议方向：
 
 1. `mars-xlog-core`、`mars-xlog` 作为发布对象
 2. `mars-xlog-sys`、bindings crate 先全部 `publish = false`
-3. 把 C++ backend 保留为 workspace / repo 内能力，而不是 crates.io 发布能力
+3. 把 legacy C++ 代码保留为 workspace / repo 内参考，而不是 crates.io 发布能力
 
-当前第 2 条已经完成；剩余阻断在于第 3 条还没有完全落到 `mars-xlog` 自身的依赖拓扑上。
+当前这三条都已经完成；剩余阻断主要是发布顺序与发布验证。
 
 ### 5.2 P0: 补全包元数据和 docs.rs 基础面
 
@@ -231,7 +225,7 @@
 1. 默认只发布运行时代码、必要测试、README、LICENSE/NOTICE 和最小示例
 2. benchmark 数据、fixture、大型 example 优先留在仓库，不进发布包
 
-当前第一步已完成，但还需要继续把纯 Rust 发布面不需要的 C++ backend 源码从公开发布对象里剥离出去。
+当前第一步已完成，`mars-xlog` 已不再携带 C++ backend 源码和依赖链进入公开发布面。
 
 ### 5.4 P1: API 与语义说明收口
 
@@ -273,7 +267,7 @@
 建议按下面顺序推进：
 
 1. 先定发布对象和 `publish = false` 范围
-2. 再调整 `mars-xlog` 的发布依赖拓扑，确保它能作为 Rust-only crate 做 dry-run
+2. 先发布 `mars-xlog-core`，再验证 `mars-xlog` 的 crates.io dry-run
 3. 补全 `mars-xlog-core` / `mars-xlog` 元数据与 README/docs.rs
 4. 收口 package contents
 5. 建立发布 CI

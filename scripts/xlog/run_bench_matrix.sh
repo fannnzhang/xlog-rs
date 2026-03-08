@@ -12,7 +12,7 @@ Options:
   --manifest <file>       Path to TSV manifest (required)
   --out-root <dir>        Output root directory (required)
   --runs <n>              Runs per scenario per backend (default: 3)
-  --backends <list>       Comma-separated backends: rust,cpp (default: rust,cpp)
+  --backends <list>       Comma-separated backends: rust (default: rust)
   --filter <pattern>      Only run scenarios matching this grep pattern
   --backend-order <mode>  fixed|alternating|randomized (default: randomized)
   --order-seed <text>     Seed for randomized backend order (default: unix epoch seconds)
@@ -28,7 +28,7 @@ USAGE
 manifest=""
 out_root=""
 runs=3
-backends="rust,cpp"
+backends="rust"
 filter=""
 skip_build=0
 run_components=0
@@ -310,9 +310,13 @@ if [[ "${#requested_backends[@]}" -eq 0 ]]; then
 fi
 for be in "${requested_backends[@]}"; do
   case "$be" in
-    rust|cpp) ;;
+    rust) ;;
+    cpp)
+      echo "error: backend 'cpp' is no longer exposed by mars-xlog; use archived comparison artifacts or a separate legacy harness" >&2
+      exit 2
+      ;;
     *)
-      echo "error: unsupported backend '$be' (allowed: rust, cpp)" >&2
+      echo "error: unsupported backend '$be' (allowed: rust)" >&2
       exit 2
       ;;
   esac
@@ -327,7 +331,7 @@ if [[ "$skip_build" -eq 0 ]]; then
   for be in "${requested_backends[@]}"; do
     log "Building ${be}-backend (release)..."
     cargo build --release -p mars-xlog --example bench_backend \
-      --no-default-features --features "${be}-backend" 2>&1 | tail -1 | tee -a "$log_file"
+      --no-default-features --features rust-backend 2>&1 | tail -1 | tee -a "$log_file"
   done
 fi
 
@@ -410,7 +414,6 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     log "  run ${run_idx}/${runs} backend order: ${backend_order[*]}"
 
     for be in "${backend_order[@]}"; do
-      feature="${be}-backend"
       results_file="$out_root/${scenario}/results_${be}.jsonl"
       run_dir="$out_root/${scenario}/${be}-run${run_idx}"
       cache_dir_arg=""
@@ -418,7 +421,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 
       cmd=(
         cargo run --release -p mars-xlog --example bench_backend
-        --no-default-features --features "$feature" --
+        --no-default-features --features rust-backend --
         --out-dir "$run_dir"
         --prefix "${scenario}-${be}"
         --messages "$messages"

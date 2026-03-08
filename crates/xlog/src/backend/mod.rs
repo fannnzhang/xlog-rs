@@ -2,11 +2,8 @@ use std::sync::Arc;
 
 use crate::{AppenderMode, FileIoAction, LogLevel, RawLogMeta, XlogConfig, XlogError};
 
-#[cfg(all(feature = "rust-backend", feature = "cpp-backend"))]
-compile_error!("enable only one backend feature at a time");
-
-#[cfg(not(any(feature = "rust-backend", feature = "cpp-backend")))]
-compile_error!("xlog requires either `rust-backend` or `cpp-backend`");
+#[cfg(not(feature = "rust-backend"))]
+compile_error!("mars-xlog requires the `rust-backend` feature; the C++ backend is repository-local only");
 
 #[cfg(any(
     target_os = "ios",
@@ -16,11 +13,7 @@ compile_error!("xlog requires either `rust-backend` or `cpp-backend`");
 ))]
 use crate::ConsoleFun;
 
-#[cfg(feature = "cpp-backend")]
-mod cpp;
-#[cfg(feature = "rust-backend")]
 mod rust;
-#[cfg(feature = "rust-backend")]
 mod stage_profile;
 
 pub(crate) trait XlogBackend: Send + Sync {
@@ -87,38 +80,30 @@ pub(crate) trait XlogBackendProvider: Send + Sync {
 }
 
 pub(crate) fn provider() -> &'static dyn XlogBackendProvider {
-    #[cfg(feature = "rust-backend")]
-    {
-        return rust::provider();
-    }
-
-    #[cfg(feature = "cpp-backend")]
-    {
-        return cpp::provider();
-    }
+    rust::provider()
 }
 
-#[cfg(all(feature = "rust-backend", feature = "bench-internals"))]
+#[cfg(feature = "bench-internals")]
 pub(crate) fn set_rust_sync_stage_profile_enabled(enabled: bool) {
     rust::set_sync_stage_profile_enabled(enabled);
 }
 
-#[cfg(all(feature = "rust-backend", feature = "bench-internals"))]
+#[cfg(feature = "bench-internals")]
 pub(crate) fn set_rust_async_stage_profile_enabled(enabled: bool) {
     rust::set_async_stage_profile_enabled(enabled);
 }
 
-#[cfg(all(feature = "rust-backend", feature = "bench-internals"))]
+#[cfg(feature = "bench-internals")]
 pub(crate) fn mark_rust_async_flush_hint_flush_every() {
     rust::mark_async_flush_hint_flush_every();
 }
 
-#[cfg(all(feature = "rust-backend", feature = "bench-internals"))]
+#[cfg(feature = "bench-internals")]
 pub(crate) fn take_rust_sync_stage_stats() -> Option<crate::bench::RustSyncStageStats> {
     rust::take_sync_stage_stats()
 }
 
-#[cfg(all(feature = "rust-backend", feature = "bench-internals"))]
+#[cfg(feature = "bench-internals")]
 pub(crate) fn take_rust_async_stage_stats() -> Option<crate::bench::RustAsyncStageStats> {
     rust::take_async_stage_stats()
 }
