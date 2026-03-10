@@ -2,7 +2,7 @@
 //!
 //! This crate owns the high-level Rust API used by platform bindings and
 //! direct Rust integrations. The default release surface is pure Rust and
-//! built on top of `mars-xlog-core`; benchmark-only hooks stay feature-gated
+//! built on top of `mars-xlog-core`; optional metrics hooks stay feature-gated
 //! and out of the default public API.
 //!
 //! # Quick start
@@ -18,15 +18,11 @@
 //! # Feature flags
 //! - `macros`: `xlog!` and level helpers that capture file/module/line.
 //! - `tracing`: `XlogLayer` for `tracing-subscriber`.
-//! - `bench-internals`: benchmark-only profiling helpers kept out of the
-//!   default release API surface.
+//! - `metrics`: emits structured runtime metrics via the `metrics` crate.
 use libc::c_int;
 use std::sync::Arc;
 
 mod backend;
-#[cfg(feature = "bench-internals")]
-pub mod bench;
-
 #[cfg(feature = "tracing")]
 mod tracing_layer;
 

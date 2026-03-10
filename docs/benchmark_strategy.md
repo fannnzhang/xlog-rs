@@ -19,8 +19,8 @@
    - `cargo bench -p mars-xlog --bench criterion_write_path`
 2. Rust 端到端矩阵
    - `scripts/xlog/run_bench_matrix.sh --manifest scripts/xlog/bench_matrix.tsv --out-root <dir> --backends rust --runs 1 --components`
-3. 需要更细归因时，再打开 feature-gated profile
-   - `cargo run --release -p mars-xlog --example bench_backend --no-default-features --features rust-backend,bench-internals -- --out-dir <dir> --stage-profile ...`
+3. 需要更细归因时，启用 `metrics` 并通过 recorder 采集
+   - `cargo run --release -p mars-xlog --example bench_backend --no-default-features --features rust-backend,metrics -- --out-dir <dir> ...`
 
 当前能力面：
 
@@ -28,7 +28,7 @@
    - 支持 `mode / threads / compress / compress-level / msg-size / flush-every / cache-days / max-file-size / pub-key`
    - 支持 `payload_profile`（`compressible / semi_structured / human_text / high_entropy`）与 `payload_seed`
    - 输出 `lat_min / avg / stdev / p50 / p95 / p99 / p999 / max / output_bytes / bytes_per_msg`
-   - `bench-internals` 下可输出 Rust sync/async stage profile
+   - `metrics` 下会输出 Rust sync/async 关键阶段指标（需要 recorder）
 2. `run_bench_matrix.sh`
    - manifest-driven 场景管理
    - Rust-only backend 运行，顺序策略仍支持 `fixed / alternating / randomized`
@@ -168,7 +168,7 @@
 
 ### 4.3 async 归因已补到 block 级
 
-当前 stage profile 已同时覆盖两层信息：
+当前 `metrics` 已同时覆盖两层信息：
 
 1. 延迟分布：`format / checkout / append / force_flush`
 2. 结构化 block 统计：
@@ -179,7 +179,7 @@
    - frontend `block_send` ratio
    - engine flush requeue count
 
-当前 `bench_backend --stage-profile` 的 JSON 已经可以直接解释：
+通过 metrics recorder 输出可以直接解释：
 
 1. block 是怎么被 finalize 的
 2. 每块积累了多少行与多少字节
@@ -255,7 +255,7 @@
 1. 标准 Rust 微基准
    - `scripts/xlog/run_criterion_bench.sh --out-root artifacts/criterion/<run_name>`
 2. 需要阶段归因时
-   - `cargo run --release -p mars-xlog --example bench_backend --no-default-features --features rust-backend,bench-internals -- --out-dir <dir> --stage-profile ...`
+   - `cargo run --release -p mars-xlog --example bench_backend --no-default-features --features rust-backend,metrics -- --out-dir <dir> ...`
 3. 跑 Rust 矩阵
    - `scripts/xlog/run_bench_matrix.sh --manifest scripts/xlog/bench_matrix.tsv --out-root <current_root> --backends rust --runs 1 --components`
 4. 单次分析

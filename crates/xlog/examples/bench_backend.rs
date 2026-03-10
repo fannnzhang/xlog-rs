@@ -5,13 +5,6 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::Instant;
 
-#[cfg(feature = "bench-internals")]
-use mars_xlog::bench::{
-    mark_rust_async_flush_hint_flush_every, set_rust_async_stage_profile_enabled,
-    set_rust_sync_stage_profile_enabled, take_rust_async_stage_stats, take_rust_sync_stage_stats,
-    AsyncPendingBlockStats, RustAsyncStageStats, RustSyncStageStats, StageLatencyStats,
-    ValueDistributionStats,
-};
 use mars_xlog::{AppenderMode, CompressMode, LogLevel, Xlog, XlogConfig};
 
 const USAGE: &str = "\
@@ -38,7 +31,6 @@ Options:
   --max-file-size <n>      Max logfile size in bytes (default: 0 = disabled)
   --pub-key <hex>          Optional 128-char public key to enable crypto
   --time-buckets <n>       Number of timeline buckets to emit (default: 0 = disabled)
-  --stage-profile          Enable Rust stage profiling (requires feature bench-internals)
   --json-pretty            Pretty-print JSON result
 ";
 
@@ -80,7 +72,6 @@ struct Options {
     max_file_size: i64,
     pub_key: Option<String>,
     time_buckets: usize,
-    stage_profile: bool,
     json_pretty: bool,
 }
 
@@ -159,7 +150,6 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let opts = parse_args()?;
-    configure_stage_profile(opts.stage_profile)?;
     fs::create_dir_all(&opts.out_dir)
         .map_err(|e| format!("create out dir failed {}: {e}", opts.out_dir.display()))?;
     if let Some(cache_dir) = &opts.cache_dir {
@@ -309,8 +299,6 @@ fn run() -> Result<(), String> {
 
     logger.flush(true);
     drop(logger);
-    let (sync_stage_profile, async_stage_profile) = take_stage_profile_json();
-    configure_stage_profile(false)?;
     let total_elapsed = start.elapsed();
     let output_bytes_end = output_bytes(&opts.out_dir, opts.cache_dir.as_deref());
 
@@ -402,24 +390,6 @@ fn run() -> Result<(), String> {
     } else {
         append_json_array_empty(&mut json, "timeline_buckets");
     }
-    if let Some(stats_json) = sync_stage_profile.as_ref() {
-        if !json.ends_with('{') {
-            json.push(',');
-        }
-        json.push_str("\"sync_stage_profile\":");
-        json.push_str(stats_json);
-    } else {
-        append_json_null(&mut json, "sync_stage_profile");
-    }
-    if let Some(stats_json) = async_stage_profile.as_ref() {
-        if !json.ends_with('{') {
-            json.push(',');
-        }
-        json.push_str("\"async_stage_profile\":");
-        json.push_str(stats_json);
-    } else {
-        append_json_null(&mut json, "async_stage_profile");
-    }
     json.push('}');
 
     if opts.json_pretty {
@@ -475,7 +445,6 @@ fn parse_args() -> Result<Options, String> {
     let mut max_file_size = 0i64;
     let mut pub_key: Option<String> = None;
     let mut time_buckets = 0usize;
-    let mut stage_profile = false;
     let mut json_pretty = false;
 
     let mut iter = env::args().skip(1);
@@ -607,7 +576,6 @@ fn parse_args() -> Result<Options, String> {
                     .parse::<usize>()
                     .map_err(|e| format!("invalid --time-buckets value {v}: {e}"))?;
             }
-            "--stage-profile" => stage_profile = true,
             "--json-pretty" => json_pretty = true,
             unknown => return Err(format!("unknown argument: {unknown}\n\n{USAGE}")),
         }
@@ -651,7 +619,6 @@ fn parse_args() -> Result<Options, String> {
         max_file_size,
         pub_key,
         time_buckets,
-        stage_profile,
         json_pretty,
     })
 }
@@ -903,219 +870,6 @@ fn append_json_array_empty(json: &mut String, key: &str) {
     json.push_str("\":[]");
 }
 
-#[cfg(feature = "bench-internals")]
-fn configure_stage_profile(enabled: bool) -> Result<(), String> {
-    set_rust_sync_stage_profile_enabled(enabled);
-    set_rust_async_stage_profile_enabled(enabled);
-    Ok(())
-}
-
-#[cfg(not(feature = "bench-internals"))]
-fn configure_stage_profile(enabled: bool) -> Result<(), String> {
-    if enabled {
-        return Err("--stage-profile requires `cargo run --features bench-internals`".to_string());
-    }
-    Ok(())
-}
-
-#[cfg(feature = "bench-internals")]
-fn take_stage_profile_json() -> (Option<String>, Option<String>) {
-    (
-        take_rust_sync_stage_stats()
-            .as_ref()
-            .map(sync_stage_profile_json),
-        take_rust_async_stage_stats()
-            .as_ref()
-            .map(async_stage_profile_json),
-    )
-}
-
-#[cfg(not(feature = "bench-internals"))]
-fn take_stage_profile_json() -> (Option<String>, Option<String>) {
-    (None, None)
-}
-
-#[cfg(feature = "bench-internals")]
-fn stage_latency_json(stage: &StageLatencyStats) -> String {
-    let mut json = String::new();
-    json.push('{');
-    append_json_num(&mut json, "avg_ns", stage.avg_ns, 3);
-    append_json_num(&mut json, "p50_ns", stage.p50_ns as f64, 0);
-    append_json_num(&mut json, "p95_ns", stage.p95_ns as f64, 0);
-    append_json_num(&mut json, "p99_ns", stage.p99_ns as f64, 0);
-    append_json_num(&mut json, "max_ns", stage.max_ns as f64, 0);
-    json.push('}');
-    json
-}
-
-#[cfg(feature = "bench-internals")]
-fn value_distribution_json(stats: &ValueDistributionStats) -> String {
-    let mut json = String::new();
-    json.push('{');
-    append_json_num(&mut json, "avg", stats.avg, 3);
-    append_json_num(&mut json, "p50", stats.p50 as f64, 0);
-    append_json_num(&mut json, "p95", stats.p95 as f64, 0);
-    append_json_num(&mut json, "p99", stats.p99 as f64, 0);
-    append_json_num(&mut json, "max", stats.max as f64, 0);
-    json.push('}');
-    json
-}
-
-#[cfg(feature = "bench-internals")]
-fn pending_block_stats_json(stats: &AsyncPendingBlockStats) -> String {
-    let mut json = String::new();
-    json.push('{');
-    append_json_num(
-        &mut json,
-        "finalized_blocks",
-        stats.finalized_blocks as f64,
-        0,
-    );
-    append_json_num(&mut json, "total_lines", stats.total_lines as f64, 0);
-    append_json_num(
-        &mut json,
-        "total_raw_input_bytes",
-        stats.total_raw_input_bytes as f64,
-        0,
-    );
-    append_json_num(
-        &mut json,
-        "total_payload_bytes",
-        stats.total_payload_bytes as f64,
-        0,
-    );
-    json.push(',');
-    json.push_str("\"lines_per_block\":");
-    json.push_str(&value_distribution_json(&stats.lines_per_block));
-    json.push(',');
-    json.push_str("\"raw_input_bytes_per_block\":");
-    json.push_str(&value_distribution_json(&stats.raw_input_bytes_per_block));
-    json.push(',');
-    json.push_str("\"payload_bytes_per_block\":");
-    json.push_str(&value_distribution_json(&stats.payload_bytes_per_block));
-    json.push(',');
-    json.push_str("\"finalize_reason_counts\":{");
-    append_json_num(
-        &mut json,
-        "threshold",
-        stats.finalized_by_threshold as f64,
-        0,
-    );
-    append_json_num(
-        &mut json,
-        "explicit_flush",
-        stats.finalized_by_explicit_flush as f64,
-        0,
-    );
-    append_json_num(
-        &mut json,
-        "flush_every",
-        stats.finalized_by_flush_every as f64,
-        0,
-    );
-    append_json_num(&mut json, "timeout", stats.finalized_by_timeout as f64, 0);
-    append_json_num(&mut json, "stop", stats.finalized_by_stop as f64, 0);
-    append_json_num(&mut json, "unknown", stats.finalized_by_unknown as f64, 0);
-    json.push('}');
-    json.push('}');
-    json
-}
-
-#[cfg(feature = "bench-internals")]
-fn sync_stage_profile_json(stats: &RustSyncStageStats) -> String {
-    let mut json = String::new();
-    json.push('{');
-    append_json_str(&mut json, "percentile_kind", "histogram_upper_bound");
-    append_json_num(&mut json, "samples", stats.samples as f64, 0);
-    if !json.ends_with('{') {
-        json.push(',');
-    }
-    json.push_str("\"total\":");
-    json.push_str(&stage_latency_json(&stats.total));
-    json.push(',');
-    json.push_str("\"format\":");
-    json.push_str(&stage_latency_json(&stats.format));
-    json.push(',');
-    json.push_str("\"block\":");
-    json.push_str(&stage_latency_json(&stats.block));
-    json.push(',');
-    json.push_str("\"engine_write\":");
-    json.push_str(&stage_latency_json(&stats.engine_write));
-    json.push('}');
-    json
-}
-
-#[cfg(feature = "bench-internals")]
-fn async_stage_profile_json(stats: &RustAsyncStageStats) -> String {
-    let mut json = String::new();
-    json.push('{');
-    append_json_str(&mut json, "percentile_kind", "histogram_upper_bound");
-    append_json_num(&mut json, "samples", stats.samples as f64, 0);
-    append_json_num(
-        &mut json,
-        "queue_full_count",
-        stats.queue_full_count as f64,
-        0,
-    );
-    append_json_num(
-        &mut json,
-        "block_send_count",
-        stats.block_send_count as f64,
-        0,
-    );
-    append_json_num(&mut json, "block_send_ratio", stats.block_send_ratio, 6);
-    append_json_num(&mut json, "block_send_ns", stats.block_send_ns as f64, 0);
-    append_json_num(
-        &mut json,
-        "queue_depth_high_watermark",
-        stats.queue_depth_high_watermark as f64,
-        0,
-    );
-    append_json_num(
-        &mut json,
-        "flush_requeue_count",
-        stats.flush_requeue_count as f64,
-        0,
-    );
-    if !json.ends_with('{') {
-        json.push(',');
-    }
-    json.push_str("\"total\":");
-    json.push_str(&stage_latency_json(&stats.total));
-    json.push(',');
-    json.push_str("\"format\":");
-    json.push_str(&stage_latency_json(&stats.format));
-    json.push(',');
-    json.push_str("\"checkout\":");
-    json.push_str(&stage_latency_json(&stats.checkout));
-    json.push(',');
-    json.push_str("\"checkout_lock\":");
-    json.push_str(&stage_latency_json(&stats.checkout_lock));
-    json.push(',');
-    json.push_str("\"checkout_wait\":");
-    json.push_str(&stage_latency_json(&stats.checkout_wait));
-    json.push(',');
-    json.push_str("\"begin_pending\":");
-    json.push_str(&stage_latency_json(&stats.begin_pending));
-    json.push(',');
-    json.push_str("\"append\":");
-    json.push_str(&stage_latency_json(&stats.append));
-    json.push(',');
-    json.push_str("\"force_flush\":");
-    json.push_str(&stage_latency_json(&stats.force_flush));
-    json.push(',');
-    json.push_str("\"pending_blocks\":");
-    json.push_str(&pending_block_stats_json(&stats.pending_blocks));
-    json.push('}');
-    json
-}
-
-#[cfg(feature = "bench-internals")]
-fn mark_flush_every_hint() {
-    mark_rust_async_flush_hint_flush_every();
-}
-
-#[cfg(not(feature = "bench-internals"))]
 fn mark_flush_every_hint() {}
 
 fn pretty_json(input: &str) -> String {

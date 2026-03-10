@@ -285,7 +285,7 @@
 1. sync / fatal 当前不是“每条日志立即 durable”
 2. 当前 durability 边界
 3. 当前 active semantic blocker 对使用约束的影响
-4. `bench-internals` 不是公共稳定 API
+4. `metrics` 仅提供可选诊断输出，不作为稳定 API 承诺
 5. `mars-xlog-core` 是否承诺稳定公共 API，还是仅作为 `mars-xlog` 的依赖实现
 
 对 `mars-xlog-core` 而言，当前更具体的收口顺序应是：
