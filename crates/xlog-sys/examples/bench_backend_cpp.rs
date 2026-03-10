@@ -1,20 +1,20 @@
 use std::env;
+use std::ffi::CString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::ptr;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::Instant;
 
-use mars_xlog::{AppenderMode, CompressMode, LogLevel, Xlog, XlogConfig};
-
-#[cfg(feature = "metrics-prometheus")]
-use metrics_exporter_prometheus::PrometheusBuilder;
+use libc::{c_int, c_long, timeval};
+use mars_xlog_sys as sys;
 
 const USAGE: &str = "\
-Benchmark xlog backend write throughput and latency.
+Benchmark Mars C++ xlog backend write throughput and latency.
 
 Usage:
-  cargo run -p mars-xlog --example bench_backend -- [options]
+  cargo run -p mars-xlog-sys --example bench_backend_cpp -- [options]
 
 Options:
   --out-dir <path>         Output directory for logs (required)
@@ -34,9 +34,21 @@ Options:
   --max-file-size <n>      Max logfile size in bytes (default: 0 = disabled)
   --pub-key <hex>          Optional 128-char public key to enable crypto
   --time-buckets <n>       Number of timeline buckets to emit (default: 0 = disabled)
-  --metrics-out <path>     Write Prometheus text format snapshot (requires metrics-prometheus)
+  --metrics-out <path>     Ignored (Rust metrics only)
   --json-pretty            Pretty-print JSON result
 ";
+
+#[derive(Debug, Copy, Clone)]
+enum AppenderMode {
+    Async,
+    Sync,
+}
+
+#[derive(Debug, Copy, Clone)]
+enum CompressMode {
+    Zlib,
+    Zstd,
+}
 
 #[derive(Debug, Copy, Clone)]
 enum PayloadProfile {
@@ -146,6 +158,118 @@ impl PayloadPool {
     }
 }
 
+struct CppLogger {
+    instance: usize,
+    prefix: CString,
+    tag: CString,
+    filename: CString,
+    func_name: CString,
+}
+
+impl CppLogger {
+    fn init(opts: &Options) -> Result<Arc<Self>, String> {
+        let logdir = CString::new(opts.out_dir.to_string_lossy().as_bytes())
+            .map_err(|_| "logdir contains NUL".to_string())?;
+        let prefix =
+            CString::new(opts.prefix.clone()).map_err(|_| "prefix contains NUL".to_string())?;
+        let pub_key = match &opts.pub_key {
+            Some(value) => {
+                Some(CString::new(value.as_str()).map_err(|_| "pub_key contains NUL".to_string())?)
+            }
+            None => None,
+        };
+        let cache_dir = match &opts.cache_dir {
+            Some(path) => Some(
+                CString::new(path.to_string_lossy().as_bytes())
+                    .map_err(|_| "cache_dir contains NUL".to_string())?,
+            ),
+            None => None,
+        };
+
+        let cfg = sys::MarsXlogConfig {
+            mode: to_sys_mode(opts.mode) as c_int,
+            logdir: logdir.as_ptr(),
+            nameprefix: prefix.as_ptr(),
+            pub_key: pub_key.as_ref().map(|v| v.as_ptr()).unwrap_or(ptr::null()),
+            compress_mode: to_sys_compress(opts.compress) as c_int,
+            compress_level: opts.compress_level,
+            cache_dir: cache_dir
+                .as_ref()
+                .map(|v| v.as_ptr())
+                .unwrap_or(ptr::null()),
+            cache_days: opts.cache_days,
+        };
+
+        unsafe {
+            sys::mars_xlog_appender_open(&cfg, sys::TLogLevel::kLevelInfo as c_int);
+        }
+        let instance =
+            unsafe { sys::mars_xlog_new_instance(&cfg, sys::TLogLevel::kLevelInfo as c_int) };
+        if instance == 0 {
+            return Err("mars_xlog_new_instance failed".to_string());
+        }
+        unsafe {
+            sys::mars_xlog_set_console_log_open(instance, 0);
+            sys::mars_xlog_set_appender_mode(instance, to_sys_mode(opts.mode) as c_int);
+        }
+        if opts.max_file_size > 0 {
+            unsafe {
+                sys::mars_xlog_set_max_file_size(instance, opts.max_file_size as c_long);
+            }
+        }
+
+        Ok(Arc::new(Self {
+            instance,
+            prefix,
+            tag: CString::new("bench").expect("static tag"),
+            filename: CString::new("bench_backend_cpp.rs").expect("static filename"),
+            func_name: CString::new("emit").expect("static func_name"),
+        }))
+    }
+
+    fn write_message(&self, msg: &str) {
+        let c_msg = CString::new(msg).expect("message contains NUL");
+        let mut tv = timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        unsafe {
+            libc::gettimeofday(&mut tv, ptr::null_mut());
+        }
+        let info = sys::XLoggerInfo {
+            level: sys::TLogLevel::kLevelInfo,
+            tag: self.tag.as_ptr(),
+            filename: self.filename.as_ptr(),
+            func_name: self.func_name.as_ptr(),
+            line: 1,
+            timeval: tv,
+            pid: -1,
+            tid: -1,
+            maintid: -1,
+            traceLog: 0,
+        };
+        unsafe {
+            sys::mars_xlog_write(self.instance, &info, c_msg.as_ptr());
+        }
+    }
+
+    fn flush(&self, sync: bool) {
+        unsafe {
+            sys::mars_xlog_flush(self.instance, if sync { 1 } else { 0 });
+        }
+    }
+}
+
+impl Drop for CppLogger {
+    fn drop(&mut self) {
+        unsafe {
+            sys::mars_xlog_flush(self.instance, 1);
+            sys::mars_xlog_release_instance(self.prefix.as_ptr());
+            sys::mars_xlog_appender_close();
+        }
+    }
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
@@ -155,7 +279,7 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let opts = parse_args()?;
-    let metrics_handle = install_metrics_recorder();
+    let _ = &opts.metrics_out;
     fs::create_dir_all(&opts.out_dir)
         .map_err(|e| format!("create out dir failed {}: {e}", opts.out_dir.display()))?;
     if let Some(cache_dir) = &opts.cache_dir {
@@ -165,25 +289,7 @@ fn run() -> Result<(), String> {
 
     let initial_output_bytes = output_bytes(&opts.out_dir, opts.cache_dir.as_deref());
 
-    let mut cfg = XlogConfig::new(
-        opts.out_dir.to_string_lossy().to_string(),
-        opts.prefix.clone(),
-    )
-    .mode(opts.mode)
-    .compress_mode(opts.compress)
-    .compress_level(opts.compress_level);
-    if let Some(cache_dir) = &opts.cache_dir {
-        cfg = cfg
-            .cache_dir(cache_dir.to_string_lossy().to_string())
-            .cache_days(opts.cache_days);
-    }
-    if let Some(pub_key) = &opts.pub_key {
-        cfg = cfg.pub_key(pub_key.clone());
-    }
-    let logger = Xlog::init(cfg, LogLevel::Info).map_err(|e| format!("xlog init: {e}"))?;
-    if opts.max_file_size > 0 {
-        logger.set_max_file_size(opts.max_file_size);
-    }
+    let logger = CppLogger::init(&opts)?;
 
     let payload_pool = Arc::new(PayloadPool::new(
         opts.payload_profile,
@@ -217,14 +323,7 @@ fn run() -> Result<(), String> {
             for local_idx in 0..warmup_messages {
                 let payload = payload_pool.pick(thread_idx, local_idx);
                 let msg = format!("BENCH|W|T{thread_idx:02}|{:08}|{}", local_idx, payload);
-                logger.write_with_meta(
-                    LogLevel::Info,
-                    Some("bench"),
-                    "bench_backend.rs",
-                    "warmup_emit",
-                    1,
-                    &msg,
-                );
+                logger.write_message(&msg);
                 warmup_written += 1;
                 if flush_every > 0 && warmup_written % flush_every == 0 {
                     mark_flush_every_hint();
@@ -251,14 +350,7 @@ fn run() -> Result<(), String> {
                 let payload = payload_pool.pick(thread_idx, local_idx + warmup_messages);
                 let msg = format!("BENCH|T{thread_idx:02}|{:08}|{}", global_idx, payload);
                 let begin = Instant::now();
-                logger.write_with_meta(
-                    LogLevel::Info,
-                    Some("bench"),
-                    "bench_backend.rs",
-                    "emit",
-                    1,
-                    &msg,
-                );
+                logger.write_message(&msg);
                 let lat = begin.elapsed().as_nanos() as u64;
                 lat_ns.push(lat);
                 if capture_timeline {
@@ -304,7 +396,6 @@ fn run() -> Result<(), String> {
     }
 
     logger.flush(true);
-    drop(logger);
     let total_elapsed = start.elapsed();
     let output_bytes_end = output_bytes(&opts.out_dir, opts.cache_dir.as_deref());
 
@@ -403,10 +494,6 @@ fn run() -> Result<(), String> {
     } else {
         println!("{json}");
     }
-    if let Some(path) = opts.metrics_out {
-        write_metrics_snapshot(metrics_handle.as_ref(), &path)?;
-    }
-
     Ok(())
 }
 
@@ -615,6 +702,10 @@ fn parse_args() -> Result<Options, String> {
     }
     if compress_level < 0 {
         return Err("--compress-level must be >= 0".to_string());
+    }
+
+    if metrics_out.is_some() {
+        eprintln!("warning: --metrics-out ignored for C++ backend");
     }
 
     Ok(Options {
@@ -828,6 +919,20 @@ fn compress_name(mode: CompressMode) -> &'static str {
     }
 }
 
+fn to_sys_mode(mode: AppenderMode) -> sys::TAppenderMode {
+    match mode {
+        AppenderMode::Async => sys::TAppenderMode::kAppenderAsync,
+        AppenderMode::Sync => sys::TAppenderMode::kAppenderSync,
+    }
+}
+
+fn to_sys_compress(mode: CompressMode) -> sys::TCompressMode {
+    match mode {
+        CompressMode::Zlib => sys::TCompressMode::kZlib,
+        CompressMode::Zstd => sys::TCompressMode::kZstd,
+    }
+}
+
 fn json_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -888,44 +993,6 @@ fn append_json_array_empty(json: &mut String, key: &str) {
 }
 
 fn mark_flush_every_hint() {}
-
-#[cfg(feature = "metrics-prometheus")]
-fn install_metrics_recorder() -> Option<metrics_exporter_prometheus::PrometheusHandle> {
-    PrometheusBuilder::new().install_recorder().ok()
-}
-
-#[cfg(not(feature = "metrics-prometheus"))]
-fn install_metrics_recorder() -> Option<()> {
-    None
-}
-
-#[cfg(feature = "metrics-prometheus")]
-fn write_metrics_snapshot(
-    handle: Option<&metrics_exporter_prometheus::PrometheusHandle>,
-    path: &Path,
-) -> Result<(), String> {
-    if handle.is_none() {
-        return Err("--metrics-out requires `--features metrics-prometheus`".to_string());
-    }
-    let Some(handle) = handle else {
-        return Ok(());
-    };
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("create metrics dir failed {}: {e}", parent.display()))?;
-        }
-    }
-    let contents = handle.render();
-    fs::write(path, contents)
-        .map_err(|e| format!("write metrics snapshot failed {}: {e}", path.display()))?;
-    Ok(())
-}
-
-#[cfg(not(feature = "metrics-prometheus"))]
-fn write_metrics_snapshot(_handle: Option<&()>, _path: &Path) -> Result<(), String> {
-    Err("--metrics-out requires `--features metrics-prometheus`".to_string())
-}
 
 fn pretty_json(input: &str) -> String {
     let mut out = String::with_capacity(input.len() + input.len() / 2);
@@ -1011,5 +1078,5 @@ fn dir_size(path: &Path) -> u64 {
 }
 
 fn backend_name() -> &'static str {
-    "rust"
+    "cpp"
 }

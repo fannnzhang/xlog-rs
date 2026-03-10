@@ -15,8 +15,8 @@ compile_error!(
 ))]
 use crate::ConsoleFun;
 
+mod metrics;
 mod rust;
-mod stage_profile;
 
 pub(crate) trait XlogBackend: Send + Sync {
     fn instance(&self) -> usize;
@@ -85,29 +85,4 @@ pub(crate) trait XlogBackendProvider: Send + Sync {
 
 pub(crate) fn provider() -> &'static dyn XlogBackendProvider {
     rust::provider()
-}
-
-#[cfg(feature = "bench-internals")]
-pub(crate) fn set_rust_sync_stage_profile_enabled(enabled: bool) {
-    rust::set_sync_stage_profile_enabled(enabled);
-}
-
-#[cfg(feature = "bench-internals")]
-pub(crate) fn set_rust_async_stage_profile_enabled(enabled: bool) {
-    rust::set_async_stage_profile_enabled(enabled);
-}
-
-#[cfg(feature = "bench-internals")]
-pub(crate) fn mark_rust_async_flush_hint_flush_every() {
-    rust::mark_async_flush_hint_flush_every();
-}
-
-#[cfg(feature = "bench-internals")]
-pub(crate) fn take_rust_sync_stage_stats() -> Option<crate::bench::RustSyncStageStats> {
-    rust::take_sync_stage_stats()
-}
-
-#[cfg(feature = "bench-internals")]
-pub(crate) fn take_rust_async_stage_stats() -> Option<crate::bench::RustAsyncStageStats> {
-    rust::take_async_stage_stats()
 }

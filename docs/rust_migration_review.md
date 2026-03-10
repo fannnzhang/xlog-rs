@@ -125,7 +125,7 @@ benchmark 相关 runner、矩阵、Criterion、CI baseline 与回归脚手架，
 
 ### 7.1 P0: async 结构化归因计数已落地
 
-当前已经可以在 `bench_backend --stage-profile` 里直接看到：
+当前已经可以通过 `metrics` 采集看到：
 
 1. pending block finalization 次数
 2. 每块行数分布

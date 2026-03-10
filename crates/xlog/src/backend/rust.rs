@@ -38,12 +38,12 @@ use mars_xlog_core::protocol::{
 use mars_xlog_core::record::LogLevel as CoreLogLevel;
 use mars_xlog_core::registry::InstanceRegistry;
 
-use super::stage_profile::{
-    async_stage_profile_enabled, record_async_block_send, record_async_dequeued,
-    record_async_enqueued, record_async_pending_block, record_async_queue_full,
-    record_async_stage_sample, record_sync_stage_sample, sync_stage_profile_enabled,
-    AsyncBuildStage, AsyncPendingFinalizeReason, AsyncStageSample, AsyncWriteFrontProfile,
-    SyncBuildStage, SyncStageSample,
+use super::metrics::{
+    record_async_block_send, record_async_dequeued, record_async_enqueued,
+    record_async_flush_requeues, record_async_pending_block, record_async_queue_full,
+    record_async_stage_sample, record_sync_stage_sample, AsyncBuildStage,
+    AsyncPendingFinalizeReason, AsyncStageSample, AsyncWriteFrontProfile, SyncBuildStage,
+    SyncStageSample, METRICS_ENABLED,
 };
 use super::{XlogBackend, XlogBackendProvider};
 use crate::{
@@ -98,11 +98,9 @@ enum AsyncFrontendCommand {
     },
 }
 
-#[cfg_attr(not(feature = "bench-internals"), allow(dead_code))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum AsyncFlushControlReason {
     Explicit,
-    FlushEvery,
 }
 
 struct AsyncWriteCommand {
@@ -316,15 +314,12 @@ impl AsyncFlushControlReason {
     fn profiler_reason(self) -> AsyncPendingFinalizeReason {
         match self {
             AsyncFlushControlReason::Explicit => AsyncPendingFinalizeReason::ExplicitFlush,
-            AsyncFlushControlReason::FlushEvery => AsyncPendingFinalizeReason::FlushEvery,
         }
     }
 
     fn engine_reason(self) -> EngineAsyncFlushReason {
         match self {
-            AsyncFlushControlReason::Explicit | AsyncFlushControlReason::FlushEvery => {
-                EngineAsyncFlushReason::Explicit
-            }
+            AsyncFlushControlReason::Explicit => EngineAsyncFlushReason::Explicit,
         }
     }
 }
@@ -413,11 +408,6 @@ thread_local! {
     }) };
 }
 
-#[cfg(feature = "bench-internals")]
-thread_local! {
-    static NEXT_ASYNC_FLUSH_HINT_FLUSH_EVERY: Cell<bool> = const { Cell::new(false) };
-}
-
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 static GLOBAL_MAX_FILE_SIZE: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_MAX_ALIVE_TIME: AtomicI64 = AtomicI64::new(0);
@@ -435,26 +425,6 @@ const ASYNC_LINE_POOL_MAX_CAPACITY: usize = 8 * 1024;
 const ASYNC_LINE_BUFFER_INIT_CAPACITY: usize = 512;
 const ASYNC_LINE_POOL_SHARD_SENTINEL: usize = usize::MAX;
 
-#[cfg(feature = "bench-internals")]
-fn mark_next_async_flush_hint_flush_every() {
-    NEXT_ASYNC_FLUSH_HINT_FLUSH_EVERY.with(|flag| flag.set(true));
-}
-
-#[cfg(feature = "bench-internals")]
-fn take_async_flush_control_reason(sync: bool) -> AsyncFlushControlReason {
-    if sync {
-        return AsyncFlushControlReason::Explicit;
-    }
-    NEXT_ASYNC_FLUSH_HINT_FLUSH_EVERY.with(|flag| {
-        if flag.replace(false) {
-            AsyncFlushControlReason::FlushEvery
-        } else {
-            AsyncFlushControlReason::Explicit
-        }
-    })
-}
-
-#[cfg(not(feature = "bench-internals"))]
 fn take_async_flush_control_reason(_sync: bool) -> AsyncFlushControlReason {
     AsyncFlushControlReason::Explicit
 }
@@ -761,6 +731,9 @@ fn handle_async_frontend_control(
                 reason.profiler_reason(),
             );
             let _ = engine.flush_with_reason(sync, reason.engine_reason());
+            if METRICS_ENABLED {
+                record_async_flush_requeues(engine.take_async_flush_requeue_count());
+            }
             if let Some(ack) = ack {
                 let _ = ack.send(());
             }
@@ -777,6 +750,9 @@ fn handle_async_frontend_control(
                 AsyncPendingFinalizeReason::Stop,
             );
             let _ = engine.flush_with_reason(true, EngineAsyncFlushReason::Stop);
+            if METRICS_ENABLED {
+                record_async_flush_requeues(engine.take_async_flush_requeue_count());
+            }
             let _ = ack.send(());
             true
         }
@@ -1054,51 +1030,6 @@ fn local_hour_from_timestamp(timestamp: SystemTime) -> u8 {
     chrono::Timelike::hour(&chrono::Local::now()) as u8
 }
 
-#[cfg(feature = "bench-internals")]
-pub(super) fn set_sync_stage_profile_enabled(enabled: bool) {
-    super::stage_profile::set_sync_stage_profile_enabled(enabled);
-}
-
-#[cfg(feature = "bench-internals")]
-pub(super) fn take_sync_stage_stats() -> Option<crate::bench::RustSyncStageStats> {
-    super::stage_profile::take_sync_stage_stats()
-}
-
-#[cfg(feature = "bench-internals")]
-pub(super) fn set_async_stage_profile_enabled(enabled: bool) {
-    super::stage_profile::set_async_stage_profile_enabled(enabled);
-    let _ = take_async_flush_requeue_count_total();
-}
-
-#[cfg(feature = "bench-internals")]
-pub(super) fn mark_async_flush_hint_flush_every() {
-    mark_next_async_flush_hint_flush_every();
-}
-
-#[cfg(feature = "bench-internals")]
-pub(super) fn take_async_stage_stats() -> Option<crate::bench::RustAsyncStageStats> {
-    let mut stats = super::stage_profile::take_async_stage_stats()?;
-    stats.flush_requeue_count = take_async_flush_requeue_count_total();
-    Some(stats)
-}
-
-#[cfg(feature = "bench-internals")]
-fn take_async_flush_requeue_count_total() -> u64 {
-    let mut total = 0u64;
-    let mut default_id = None;
-    if let Some(default) = registry().default_instance() {
-        default_id = Some(default.id);
-        total = total.saturating_add(default.engine.take_async_flush_requeue_count());
-    }
-    registry().for_each_live(|backend| {
-        if default_id == Some(backend.id) {
-            return;
-        }
-        total = total.saturating_add(backend.engine.take_async_flush_requeue_count());
-    });
-    total
-}
-
 fn registry() -> &'static InstanceRegistry<RustBackend> {
     static REGISTRY: OnceLock<InstanceRegistry<RustBackend>> = OnceLock::new();
     REGISTRY.get_or_init(InstanceRegistry::new)
@@ -1366,7 +1297,7 @@ impl RustBackend {
             return;
         }
 
-        if sync_stage_profile_enabled() {
+        if METRICS_ENABLED {
             with_hot_path_scratch(|scratch| {
                 let total_begin = Instant::now();
                 let mut stage = SyncBuildStage::default();
@@ -1444,7 +1375,7 @@ impl RustBackend {
 
         let timestamp = std::time::SystemTime::now();
         let now_hour = local_hour_from_timestamp(timestamp);
-        let profile_enabled = async_stage_profile_enabled();
+        let profile_enabled = METRICS_ENABLED;
         let pool_shard = current_async_line_pool_shard();
         let mut line_buf = self.async_frontend.take_line_buffer(pool_shard);
         let format_begin = profile_enabled.then(Instant::now);
@@ -1499,7 +1430,7 @@ impl RustBackend {
         let now_hour = local_hour_from_timestamp(timestamp);
         let (engine_epoch, engine_flush_reason) = self.engine.async_flush_state();
         let capacity = self.engine.buffer_capacity();
-        let profile_enabled = async_stage_profile_enabled();
+        let profile_enabled = METRICS_ENABLED;
 
         with_hot_path_scratch(|scratch| {
             let total_begin = if profile_enabled {
