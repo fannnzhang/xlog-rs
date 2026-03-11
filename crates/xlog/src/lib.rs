@@ -154,13 +154,19 @@ pub enum XlogError {
     #[error("log_dir and name_prefix must be non-empty")]
     /// Required config fields such as `log_dir` or `name_prefix` were empty.
     InvalidConfig,
+    #[error("logger `{name_prefix}` is already initialized with a different config")]
+    /// The requested `name_prefix` already exists but with a different config.
+    ConfigConflict {
+        /// Name prefix of the already-initialized logger instance.
+        name_prefix: String,
+    },
     #[error("xlog initialization failed")]
     /// Backend initialization failed.
     InitFailed,
 }
 
 /// Configuration used to create an Xlog instance or open the global appender.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XlogConfig {
     /// Directory for log files. Must be non-empty.
     pub log_dir: String,
@@ -247,7 +253,13 @@ struct Inner {
 }
 
 impl Xlog {
-    /// Initialize a new Xlog instance (recommended entrypoint).
+    /// Initialize or reuse a named Xlog instance (recommended entrypoint).
+    ///
+    /// Behavior is idempotent by `name_prefix`:
+    /// - If no live instance exists for `name_prefix`, a new instance is created.
+    /// - If a live instance exists with the same config, it is reused.
+    /// - If a live instance exists with a different config, returns
+    ///   [`XlogError::ConfigConflict`].
     pub fn init(config: XlogConfig, level: LogLevel) -> Result<Self, XlogError> {
         Self::new(config, level)
     }
@@ -275,6 +287,10 @@ impl Xlog {
     }
 
     #[doc(hidden)]
+    /// Open the global/default appender.
+    ///
+    /// If already open with a different config, returns
+    /// [`XlogError::ConfigConflict`].
     pub fn appender_open(config: XlogConfig, level: LogLevel) -> Result<(), XlogError> {
         backend::provider().appender_open(&config, level)
     }
@@ -330,17 +346,17 @@ impl Xlog {
         self.inner.backend.flush(sync);
     }
 
-    /// Enable or disable console logging (platform dependent).
+    /// Enable or disable console logging for this instance (platform dependent).
     pub fn set_console_log_open(&self, open: bool) {
         self.inner.backend.set_console_log_open(open);
     }
 
-    /// Set the max log file size in bytes (0 disables splitting).
+    /// Set the max log file size in bytes for this instance (0 disables splitting).
     pub fn set_max_file_size(&self, max_bytes: i64) {
         self.inner.backend.set_max_file_size(max_bytes);
     }
 
-    /// Set the max log file age in seconds before deletion/rotation.
+    /// Set the max log file age in seconds for this instance before deletion/rotation.
     pub fn set_max_alive_time(&self, alive_seconds: i64) {
         self.inner.backend.set_max_alive_time(alive_seconds);
     }
@@ -539,4 +555,81 @@ macro_rules! xlog_error {
     ($logger:expr, $tag:expr, $($arg:tt)+) => {{
         $crate::xlog!($logger, $crate::LogLevel::Error, $tag, $($arg)+)
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    use tempfile::TempDir;
+
+    use super::{CompressMode, LogLevel, Xlog, XlogConfig, XlogError};
+
+    static NEXT_PREFIX_ID: AtomicUsize = AtomicUsize::new(1);
+    static APPENDER_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn unique_prefix(label: &str) -> String {
+        let id = NEXT_PREFIX_ID.fetch_add(1, Ordering::Relaxed);
+        format!("{label}-{}-{id}", std::process::id())
+    }
+
+    fn appender_test_lock() -> &'static Mutex<()> {
+        APPENDER_TEST_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct AppenderCloseGuard;
+
+    impl Drop for AppenderCloseGuard {
+        fn drop(&mut self) {
+            Xlog::appender_close();
+        }
+    }
+
+    #[test]
+    fn init_reuses_same_name_prefix_and_applies_latest_level() {
+        let dir = TempDir::new().expect("tempdir");
+        let prefix = unique_prefix("reuse");
+        let cfg = XlogConfig::new(dir.path().display().to_string(), &prefix);
+
+        let first = Xlog::init(cfg.clone(), LogLevel::Info).expect("init first");
+        let second = Xlog::init(cfg, LogLevel::Debug).expect("init second");
+
+        assert_eq!(first.instance(), second.instance());
+        assert_eq!(first.level(), LogLevel::Debug);
+    }
+
+    #[test]
+    fn init_rejects_conflicting_config_for_same_name_prefix() {
+        let dir = TempDir::new().expect("tempdir");
+        let prefix = unique_prefix("conflict");
+        let cfg = XlogConfig::new(dir.path().display().to_string(), &prefix);
+        let _first = Xlog::init(cfg.clone(), LogLevel::Info).expect("init first");
+
+        let conflict_cfg = cfg.compress_mode(CompressMode::Zstd);
+        let err = match Xlog::init(conflict_cfg, LogLevel::Info) {
+            Ok(_) => panic!("must reject conflict"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            XlogError::ConfigConflict { ref name_prefix } if name_prefix == &prefix
+        ));
+    }
+
+    #[test]
+    fn appender_open_rejects_conflicting_config_when_default_exists() {
+        let _lock = appender_test_lock().lock().expect("lock poisoned");
+        let _guard = AppenderCloseGuard;
+        Xlog::appender_close();
+
+        let dir1 = TempDir::new().expect("tempdir1");
+        let dir2 = TempDir::new().expect("tempdir2");
+        let cfg1 = XlogConfig::new(dir1.path().display().to_string(), unique_prefix("global-a"));
+        let cfg2 = XlogConfig::new(dir2.path().display().to_string(), unique_prefix("global-b"));
+
+        Xlog::appender_open(cfg1, LogLevel::Info).expect("open first");
+        let err = Xlog::appender_open(cfg2, LogLevel::Info).expect_err("must reject conflict");
+        assert!(matches!(err, XlogError::ConfigConflict { .. }));
+    }
 }

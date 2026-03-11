@@ -77,9 +77,8 @@ impl XlogLayerHandle {
         self.state.enabled.load(Ordering::Acquire)
     }
 
-    /// Update the minimum log level.
+    /// Update the minimum forwarded level for this layer only.
     pub fn set_level(&self, level: LogLevel) {
-        self.state.logger.set_level(level);
         self.state
             .level
             .store(level_to_u8(level), Ordering::Release);
@@ -106,8 +105,10 @@ impl XlogLayer {
     }
 
     /// Build a layer from explicit configuration.
+    ///
+    /// This only configures layer-side filtering and does not mutate the
+    /// underlying logger's level.
     pub fn with_config(logger: Xlog, config: XlogLayerConfig) -> (Self, XlogLayerHandle) {
-        logger.set_level(config.level);
         let state = Arc::new(LayerState::new(logger, config.enabled, config.level));
         let layer = Self {
             state: Arc::clone(&state),
@@ -313,5 +314,56 @@ fn level_from_u8(value: u8) -> LogLevel {
         4 => LogLevel::Error,
         5 => LogLevel::Fatal,
         _ => LogLevel::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tempfile::TempDir;
+
+    use super::{XlogLayer, XlogLayerConfig};
+    use crate::{LogLevel, Xlog, XlogConfig};
+
+    static NEXT_PREFIX_ID: AtomicUsize = AtomicUsize::new(1);
+
+    fn unique_prefix() -> String {
+        let id = NEXT_PREFIX_ID.fetch_add(1, Ordering::Relaxed);
+        format!("tracing-layer-{}-{id}", std::process::id())
+    }
+
+    #[test]
+    fn with_config_does_not_mutate_logger_level() {
+        let dir = TempDir::new().expect("tempdir");
+        let logger = Xlog::init(
+            XlogConfig::new(dir.path().display().to_string(), unique_prefix()),
+            LogLevel::Info,
+        )
+        .expect("init logger");
+        assert_eq!(logger.level(), LogLevel::Info);
+
+        let (_layer, _handle) =
+            XlogLayer::with_config(logger.clone(), XlogLayerConfig::new(LogLevel::Debug));
+        assert_eq!(logger.level(), LogLevel::Info);
+    }
+
+    #[test]
+    fn handle_set_level_only_updates_layer_filter() {
+        let dir = TempDir::new().expect("tempdir");
+        let logger = Xlog::init(
+            XlogConfig::new(dir.path().display().to_string(), unique_prefix()),
+            LogLevel::Warn,
+        )
+        .expect("init logger");
+        let (_layer, handle) =
+            XlogLayer::with_config(logger.clone(), XlogLayerConfig::new(LogLevel::Info));
+
+        assert_eq!(logger.level(), LogLevel::Warn);
+        assert_eq!(handle.level(), LogLevel::Info);
+
+        handle.set_level(LogLevel::Debug);
+        assert_eq!(handle.level(), LogLevel::Debug);
+        assert_eq!(logger.level(), LogLevel::Warn);
     }
 }
