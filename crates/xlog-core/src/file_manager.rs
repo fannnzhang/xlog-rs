@@ -66,7 +66,7 @@ pub struct FileManager {
     name_prefix: String,
     cache_days: i32,
     runtime: Arc<Mutex<RuntimeState>>,
-    lock_file: Arc<File>,
+    _lock_file: Arc<File>,
 }
 
 #[derive(Debug, Default)]
@@ -133,6 +133,7 @@ impl FileManager {
         let lock_path = log_dir.join(format!("{}.lock", name_prefix));
         let lock_file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)
@@ -147,7 +148,7 @@ impl FileManager {
             name_prefix,
             cache_days,
             runtime: Arc::new(Mutex::new(RuntimeState::default())),
-            lock_file: Arc::new(lock_file),
+            _lock_file: Arc::new(lock_file),
         })
     }
 
@@ -1511,7 +1512,9 @@ mod tests {
         let has_logs = std::fs::read_dir(&log_dir)
             .unwrap()
             .filter_map(|entry| entry.ok())
-            .any(|entry| entry.path().extension().and_then(std::ffi::OsStr::to_str) == Some("xlog"));
+            .any(|entry| {
+                entry.path().extension().and_then(std::ffi::OsStr::to_str) == Some("xlog")
+            });
         assert!(!has_logs);
     }
 
