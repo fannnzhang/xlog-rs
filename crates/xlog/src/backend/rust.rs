@@ -1,6 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::mpsc::{
     channel as std_channel, sync_channel, Receiver as StdReceiver, SendError, Sender as StdSender,
     SyncSender, TryRecvError, TrySendError,
@@ -409,9 +409,6 @@ thread_local! {
 }
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
-static GLOBAL_MAX_FILE_SIZE: AtomicU64 = AtomicU64::new(0);
-static GLOBAL_MAX_ALIVE_TIME: AtomicI64 = AtomicI64::new(0);
-static GLOBAL_CONSOLE_OPEN: AtomicBool = AtomicBool::new(false);
 
 const ASYNC_WARNING_THRESHOLD_NUM: usize = 4;
 const ASYNC_WARNING_THRESHOLD_DEN: usize = 5;
@@ -1609,6 +1606,12 @@ impl XlogBackendProvider for RustBackendProvider {
         let backend = registry().get_or_try_insert_with(&config.name_prefix, || {
             Ok::<_, XlogError>(Arc::new(RustBackend::new(config.clone(), level)?))
         })?;
+        if backend.config != *config {
+            return Err(XlogError::ConfigConflict {
+                name_prefix: config.name_prefix.clone(),
+            });
+        }
+        backend.set_level(level);
         Ok(backend)
     }
 
@@ -1620,16 +1623,15 @@ impl XlogBackendProvider for RustBackendProvider {
 
     fn appender_open(&self, config: &XlogConfig, level: LogLevel) -> Result<(), XlogError> {
         if let Some(default) = registry().default_instance() {
+            if default.config != *config {
+                return Err(XlogError::ConfigConflict {
+                    name_prefix: default.config.name_prefix.clone(),
+                });
+            }
             default.set_level(level);
             return Ok(());
         }
         let backend = Arc::new(RustBackend::new(config.clone(), level)?);
-        let max_file_size = GLOBAL_MAX_FILE_SIZE.load(Ordering::Relaxed) as i64;
-        let max_alive_time = GLOBAL_MAX_ALIVE_TIME.load(Ordering::Relaxed);
-        let console_open = GLOBAL_CONSOLE_OPEN.load(Ordering::Relaxed);
-        backend.set_max_file_size(max_file_size);
-        backend.set_max_alive_time(max_alive_time);
-        backend.set_console_log_open(console_open);
         registry().set_default(backend);
         Ok(())
     }
@@ -1742,7 +1744,7 @@ impl XlogBackendProvider for RustBackendProvider {
             .get(&config.name_prefix)
             .or_else(|| registry().default_instance())
             .map(|b| b.engine.max_file_size())
-            .unwrap_or_else(|| GLOBAL_MAX_FILE_SIZE.load(Ordering::Relaxed));
+            .unwrap_or(0);
 
         let action = core_oneshot_flush(&file_manager, DEFAULT_BUFFER_BLOCK_LEN, max_file_size);
         Ok(match action {
@@ -1827,18 +1829,15 @@ impl XlogBackend for RustBackend {
 
     fn set_console_log_open(&self, open: bool) {
         self.console_open.store(open, Ordering::Relaxed);
-        GLOBAL_CONSOLE_OPEN.store(open, Ordering::Relaxed);
     }
 
     fn set_max_file_size(&self, max_bytes: i64) {
         let v = max_bytes.max(0) as u64;
         self.engine.set_max_file_size(v);
-        GLOBAL_MAX_FILE_SIZE.store(v, Ordering::Relaxed);
     }
 
     fn set_max_alive_time(&self, alive_seconds: i64) {
         self.engine.set_max_alive_time(alive_seconds);
-        GLOBAL_MAX_ALIVE_TIME.store(alive_seconds, Ordering::Relaxed);
     }
 
     fn write_with_meta(

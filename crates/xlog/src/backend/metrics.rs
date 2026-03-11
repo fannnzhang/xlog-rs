@@ -1,6 +1,7 @@
 pub(super) const METRICS_ENABLED: bool = cfg!(feature = "metrics");
 
 #[derive(Copy, Clone)]
+#[cfg_attr(not(feature = "metrics"), allow(dead_code))]
 pub(super) struct SyncStageSample {
     pub(super) total_ns: u64,
     pub(super) format_ns: u64,
@@ -15,6 +16,7 @@ pub(super) struct SyncBuildStage {
 }
 
 #[derive(Copy, Clone)]
+#[cfg_attr(not(feature = "metrics"), allow(dead_code))]
 pub(super) struct AsyncStageSample {
     pub(super) total_ns: u64,
     pub(super) format_ns: u64,
