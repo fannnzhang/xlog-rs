@@ -21,6 +21,11 @@ This workspace provides a Rust-native implementation of Tencent Mars `xlog`. The
 - `oh-xlog`: Harmony/ohos N-API bindings.
 - `mars-xlog-sys`: legacy raw FFI + native build (C/C++/ObjC++) crate.
 
+## Flutter package
+- `packages/xlog`: Flutter-native Dart FFI package using native assets and a Rust `cdylib`.
+- The package includes an example diagnostics app for real logging cases, stress tests, log file inspection, and Prometheus metrics snapshots.
+- The Flutter side is pinned through `fvm` in [`packages/xlog/.fvmrc`](./packages/xlog/.fvmrc).
+
 ## Build notes
 - Published Rust crates currently target Rust 1.85 or newer.
 - Default workspace build (`cargo build`) uses the Rust backend and does not require C++14/Boost toolchains.
