@@ -30,6 +30,7 @@ use crate::formatter::extract_file_name;
     target_os = "watchos"
 ))]
 use crate::platform_tid::{current_tid, main_tid};
+use crate::record::LogLevel;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 /// Severity used for platform console forwarding.
@@ -48,6 +49,20 @@ pub enum ConsoleLevel {
     Fatal,
     /// Console forwarding disabled.
     None,
+}
+
+impl From<LogLevel> for ConsoleLevel {
+    fn from(level: LogLevel) -> Self {
+        match level {
+            LogLevel::Verbose => ConsoleLevel::Verbose,
+            LogLevel::Debug => ConsoleLevel::Debug,
+            LogLevel::Info => ConsoleLevel::Info,
+            LogLevel::Warn => ConsoleLevel::Warn,
+            LogLevel::Error => ConsoleLevel::Error,
+            LogLevel::Fatal => ConsoleLevel::Fatal,
+            LogLevel::None => ConsoleLevel::None,
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -203,15 +218,7 @@ pub fn write_console_line(
 }
 
 fn level_short(level: ConsoleLevel) -> &'static str {
-    match level {
-        ConsoleLevel::Verbose => "V",
-        ConsoleLevel::Debug => "D",
-        ConsoleLevel::Info => "I",
-        ConsoleLevel::Warn => "W",
-        ConsoleLevel::Error => "E",
-        ConsoleLevel::Fatal => "F",
-        ConsoleLevel::None => "N",
-    }
+    LogLevel::from(level).short()
 }
 
 #[cfg(any(

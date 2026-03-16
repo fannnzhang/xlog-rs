@@ -14,6 +14,7 @@ use crate::metrics::{
 };
 
 const LOG_EXT: &str = "xlog";
+const LOG_EXT_WITH_DOT: &str = ".xlog";
 const CACHE_AVAILABLE_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
 // Keep-open sync path benefits from a moderate userspace append buffer under
 // contention without turning flush bursts into a new tail-latency problem.
@@ -69,7 +70,7 @@ pub struct FileManager {
     name_prefix: String,
     cache_days: i32,
     runtime: Arc<Mutex<RuntimeState>>,
-    _lock_file: Arc<File>,
+    _lock_files: Arc<Vec<File>>,
 }
 
 #[derive(Debug, Default)]
@@ -97,6 +98,8 @@ impl Drop for ActiveAppendFile {
         if self.write_buffer.is_empty() {
             return;
         }
+        // Drop cannot propagate I/O failures. Durability-sensitive paths must
+        // flush explicitly instead of relying on this best-effort write.
         let _ = self.file.write_all(&self.write_buffer);
         self.write_buffer.clear();
     }
@@ -133,17 +136,20 @@ impl FileManager {
             fs::create_dir_all(dir).map_err(|e| FileManagerError::CreateDir(dir.clone(), e))?;
         }
 
-        let lock_path = log_dir.join(format!("{}.lock", name_prefix));
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|e| FileManagerError::OpenFile(lock_path.clone(), e))?;
-        lock_file
-            .try_lock_exclusive()
-            .map_err(|e| FileManagerError::LockFile(lock_path.clone(), e))?;
+        let mut lock_files = Vec::new();
+        for lock_path in lock_paths(&log_dir, cache_dir.as_deref(), &name_prefix) {
+            let lock_file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .map_err(|e| FileManagerError::OpenFile(lock_path.clone(), e))?;
+            lock_file
+                .try_lock_exclusive()
+                .map_err(|e| FileManagerError::LockFile(lock_path.clone(), e))?;
+            lock_files.push(lock_file);
+        }
 
         Ok(Self {
             log_dir,
@@ -151,7 +157,7 @@ impl FileManager {
             name_prefix,
             cache_days,
             runtime: Arc::new(Mutex::new(RuntimeState::default())),
-            _lock_file: Arc::new(lock_file),
+            _lock_files: Arc::new(lock_files),
         })
     }
 
@@ -389,9 +395,7 @@ impl FileManager {
             let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
                 continue;
             };
-            if !file_name.starts_with(&self.name_prefix)
-                || !file_name.ends_with(&format!(".{LOG_EXT}"))
-            {
+            if !file_name.starts_with(&self.name_prefix) || !file_name.ends_with(LOG_EXT_WITH_DOT) {
                 continue;
             }
 
@@ -489,7 +493,7 @@ impl FileManager {
             let Some(name) = path.file_name().and_then(OsStr::to_str) else {
                 continue;
             };
-            if name.starts_with(file_prefix) && name.ends_with(&format!(".{LOG_EXT}")) {
+            if name.starts_with(file_prefix) && name.ends_with(LOG_EXT_WITH_DOT) {
                 out.push(path.to_string_lossy().to_string());
             }
         }
@@ -1049,9 +1053,8 @@ impl FileManager {
         });
         let last = &names[0];
 
-        let ext = format!(".{LOG_EXT}");
         let mut idx = 0i64;
-        if let Some(base) = last.strip_suffix(&ext) {
+        if let Some(base) = last.strip_suffix(LOG_EXT_WITH_DOT) {
             if let Some(rest) = base.strip_prefix(date_prefix) {
                 let rest = rest.strip_prefix('_').unwrap_or(rest);
                 idx = rest.parse::<i64>().unwrap_or(0);
@@ -1089,7 +1092,7 @@ impl FileManager {
             let Some(name) = path.file_name().and_then(OsStr::to_str) else {
                 continue;
             };
-            if name.starts_with(file_prefix) && name.ends_with(&format!(".{LOG_EXT}")) {
+            if name.starts_with(file_prefix) && name.ends_with(LOG_EXT_WITH_DOT) {
                 out.push(name.to_string());
             }
         }
@@ -1125,6 +1128,20 @@ fn build_path_for_index(dir: &Path, prefix: &str, day_key: i32, file_index: i64)
     dir.join(file_name)
 }
 
+fn lock_paths(log_dir: &Path, cache_dir: Option<&Path>, prefix: &str) -> Vec<PathBuf> {
+    let mut dirs = vec![log_dir.to_path_buf()];
+    if let Some(cache_dir) = cache_dir {
+        if cache_dir != log_dir {
+            dirs.push(cache_dir.to_path_buf());
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs.into_iter()
+        .map(|dir| dir.join(format!("{prefix}.lock")))
+        .collect()
+}
+
 fn local_file_state(path: &Path) -> (bool, u64) {
     match fs::metadata(path) {
         Ok(meta) => (true, meta.len()),
@@ -1134,8 +1151,7 @@ fn local_file_state(path: &Path) -> (bool, u64) {
 
 fn file_index_from_path(path: &Path, prefix: &str) -> Option<i64> {
     let name = path.file_name()?.to_str()?;
-    let ext = format!(".{LOG_EXT}");
-    let base = name.strip_suffix(&ext)?;
+    let base = name.strip_suffix(LOG_EXT_WITH_DOT)?;
     let prefix_part = format!("{prefix}_");
     if !name.starts_with(&prefix_part) {
         return None;
@@ -1404,6 +1420,7 @@ mod tests {
     use std::env;
     use std::fs;
     use std::fs::OpenOptions;
+    use std::path::PathBuf;
     use std::process::Command;
     use std::time::{Duration, SystemTime};
 
@@ -1568,6 +1585,7 @@ mod tests {
         let cache_entries = std::fs::read_dir(&cache_dir)
             .unwrap()
             .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(std::ffi::OsStr::to_str) == Some("xlog"))
             .collect::<Vec<_>>();
         assert_eq!(cache_entries, vec![cache_path.clone()]);
         assert_eq!(std::fs::read(&cache_path).unwrap(), b"aaaabbbbcccc");
@@ -1721,7 +1739,11 @@ mod tests {
         if env::var("XLOG_LOCK_CHILD").ok().as_deref() == Some("1") {
             let dir = env::var("XLOG_LOCK_DIR").unwrap();
             let prefix = env::var("XLOG_LOCK_PREFIX").unwrap();
-            let res = FileManager::new(dir.into(), None, prefix, 0);
+            let cache_dir = env::var("XLOG_LOCK_CACHE_DIR")
+                .ok()
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from);
+            let res = FileManager::new(dir.into(), cache_dir, prefix, 0);
             assert!(res.is_err());
             return;
         }
@@ -1737,6 +1759,51 @@ mod tests {
             .arg("--nocapture")
             .env("XLOG_LOCK_CHILD", "1")
             .env("XLOG_LOCK_DIR", root.path().to_string_lossy().to_string())
+            .env("XLOG_LOCK_PREFIX", prefix)
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+    }
+
+    #[test]
+    fn file_manager_lock_rejects_shared_cache_dir_across_processes() {
+        if env::var("XLOG_LOCK_CHILD").ok().as_deref() == Some("1") {
+            let dir = env::var("XLOG_LOCK_DIR").unwrap();
+            let prefix = env::var("XLOG_LOCK_PREFIX").unwrap();
+            let cache_dir = env::var("XLOG_LOCK_CACHE_DIR")
+                .ok()
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from);
+            let res = FileManager::new(dir.into(), cache_dir, prefix, 0);
+            assert!(res.is_err());
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let cache_dir = root.path().join("cache");
+        let log_dir_a = root.path().join("log-a");
+        let log_dir_b = root.path().join("log-b");
+        let prefix = "cachelock".to_string();
+        let _first = FileManager::new(
+            log_dir_a.clone(),
+            Some(cache_dir.clone()),
+            prefix.clone(),
+            0,
+        )
+        .unwrap();
+
+        let exe = env::current_exe().unwrap();
+        let status = Command::new(exe)
+            .arg("--exact")
+            .arg("file_manager_lock_rejects_shared_cache_dir_across_processes")
+            .arg("--nocapture")
+            .env("XLOG_LOCK_CHILD", "1")
+            .env("XLOG_LOCK_DIR", log_dir_b.to_string_lossy().to_string())
+            .env(
+                "XLOG_LOCK_CACHE_DIR",
+                cache_dir.to_string_lossy().to_string(),
+            )
             .env("XLOG_LOCK_PREFIX", prefix)
             .status()
             .unwrap();

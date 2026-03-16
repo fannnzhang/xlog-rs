@@ -32,5 +32,6 @@ pub mod platform_tid;
 pub mod protocol;
 /// Log record model used by formatter and runtime paths.
 pub mod record;
+mod recovery;
 /// Instance registry helpers.
 pub mod registry;

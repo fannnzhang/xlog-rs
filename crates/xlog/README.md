@@ -47,6 +47,10 @@ This crate is the release-facing Rust surface.
 Legacy C++ parity and benchmark support stay in the repository, but are not part
 of the intended default Rust integration path.
 
+## Notes
+
+- A given `(name_prefix, log_dir/cache_dir)` namespace is single-writer only. Initialization enforces this with `<name_prefix>.lock` files in each storage directory.
+
 ## License
 
 MIT. See the repository root `LICENSE` and `NOTICE`.

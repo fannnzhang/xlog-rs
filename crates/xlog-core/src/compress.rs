@@ -193,8 +193,20 @@ pub fn decompress_zstd_frames(input: &[u8]) -> Result<Vec<u8>, CompressError> {
 mod tests {
     use super::{
         decompress_raw_zlib, decompress_zstd_frames, CompressError, StreamCompressor,
-        ZstdChunkCompressor, ZstdStreamCompressor,
+        ZlibStreamCompressor, ZstdChunkCompressor, ZstdStreamCompressor,
     };
+
+    #[test]
+    fn zlib_stream_roundtrips_incremental_chunks() {
+        let mut compressor = ZlibStreamCompressor::new(6);
+        let mut encoded = Vec::new();
+
+        compressor.compress_chunk(b"mars", &mut encoded).unwrap();
+        compressor.compress_chunk(b" xlog", &mut encoded).unwrap();
+        compressor.flush(&mut encoded).unwrap();
+
+        assert_eq!(decompress_raw_zlib(&encoded).unwrap(), b"mars xlog");
+    }
 
     #[test]
     fn zstd_chunk_roundtrips_concatenated_frames() {

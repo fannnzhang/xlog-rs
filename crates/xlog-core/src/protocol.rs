@@ -4,6 +4,12 @@ use thiserror::Error;
 
 /// Byte length of one encoded xlog header.
 pub const HEADER_LEN: usize = 1 + 2 + 1 + 1 + 4 + 64;
+/// Byte offset of the encoded end-hour field.
+pub const HEADER_END_HOUR_OFFSET: usize = 4;
+/// Byte offset of the encoded payload-length field.
+pub const HEADER_LEN_OFFSET: usize = 5;
+/// Byte offset of the encoded client public key field.
+pub const HEADER_CLIENT_PUBKEY_OFFSET: usize = 9;
 /// Byte length of the trailing end marker.
 pub const TAILER_LEN: usize = 1;
 /// Tail marker terminating a complete xlog block.
@@ -80,9 +86,10 @@ impl LogHeader {
         out[0] = self.magic;
         out[1..3].copy_from_slice(&self.seq.to_le_bytes());
         out[3] = self.begin_hour;
-        out[4] = self.end_hour;
-        out[5..9].copy_from_slice(&self.len.to_le_bytes());
-        out[9..73].copy_from_slice(&self.client_pubkey);
+        out[HEADER_END_HOUR_OFFSET] = self.end_hour;
+        out[HEADER_LEN_OFFSET..HEADER_LEN_OFFSET + 4].copy_from_slice(&self.len.to_le_bytes());
+        out[HEADER_CLIENT_PUBKEY_OFFSET..HEADER_CLIENT_PUBKEY_OFFSET + 64]
+            .copy_from_slice(&self.client_pubkey);
         out
     }
 
@@ -97,13 +104,18 @@ impl LogHeader {
         }
 
         let mut key = [0u8; 64];
-        key.copy_from_slice(&buf[9..73]);
+        key.copy_from_slice(&buf[HEADER_CLIENT_PUBKEY_OFFSET..HEADER_CLIENT_PUBKEY_OFFSET + 64]);
         Ok(Self {
             magic,
             seq: u16::from_le_bytes([buf[1], buf[2]]),
             begin_hour: buf[3],
-            end_hour: buf[4],
-            len: u32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]),
+            end_hour: buf[HEADER_END_HOUR_OFFSET],
+            len: u32::from_le_bytes([
+                buf[HEADER_LEN_OFFSET],
+                buf[HEADER_LEN_OFFSET + 1],
+                buf[HEADER_LEN_OFFSET + 2],
+                buf[HEADER_LEN_OFFSET + 3],
+            ]),
             client_pubkey: key,
         })
     }
@@ -145,9 +157,14 @@ pub fn update_log_len_in_place(buf: &mut [u8], add_len: u32) -> Result<u32, Prot
     if buf.len() < HEADER_LEN {
         return Err(ProtocolError::InvalidHeaderLen);
     }
-    let current = u32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]);
+    let current = u32::from_le_bytes([
+        buf[HEADER_LEN_OFFSET],
+        buf[HEADER_LEN_OFFSET + 1],
+        buf[HEADER_LEN_OFFSET + 2],
+        buf[HEADER_LEN_OFFSET + 3],
+    ]);
     let next = current.saturating_add(add_len);
-    buf[5..9].copy_from_slice(&next.to_le_bytes());
+    buf[HEADER_LEN_OFFSET..HEADER_LEN_OFFSET + 4].copy_from_slice(&next.to_le_bytes());
     Ok(next)
 }
 
@@ -156,7 +173,7 @@ pub fn update_end_hour_in_place(buf: &mut [u8], hour: u8) -> Result<(), Protocol
     if buf.len() < HEADER_LEN {
         return Err(ProtocolError::InvalidHeaderLen);
     }
-    buf[4] = hour;
+    buf[HEADER_END_HOUR_OFFSET] = hour;
     Ok(())
 }
 
@@ -184,6 +201,8 @@ impl SeqGenerator {
     /// Generate the next async sequence number.
     ///
     /// Matches the historical C++ behavior: increment first, then skip `0`.
+    /// Under wraparound races concurrent callers may observe gaps, but `0` is
+    /// never returned and values are not reused.
     pub fn next_async(&self) -> u16 {
         let mut next = self.seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         if next == 0 {

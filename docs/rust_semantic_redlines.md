@@ -81,14 +81,14 @@
 
 现状：
 
-1. `FileManager::new` 在 `log_dir` 下创建 `<name_prefix>.lock` 并独占锁
-2. 锁生命周期与实例一致，同一 `(log_dir, name_prefix)` 的多进程初始化会失败
-3. 文档明确禁止多进程共享同一 `.xlog`
+1. `FileManager::new` 会在 `log_dir` 以及独立的 `cache_dir` 下创建 `<name_prefix>.lock` 并独占锁
+2. 锁生命周期与实例一致，共享同一 `(name_prefix, log_dir/cache_dir)` 命名空间的多进程初始化会失败
+3. 文档明确禁止多进程共享同一 `.xlog/.mmap3`
 
 回归要求：
 
 1. 锁文件行为必须保留，不能退回为仅文档约束
-2. 同一 `(log_dir, name_prefix)` 的多进程并发创建应失败
+2. 共享同一 `(name_prefix, log_dir/cache_dir)` 命名空间的多进程并发创建应失败
 
 ### C0-closed: recovery / oneshot 的 recovered block 必须保持连续写入
 
