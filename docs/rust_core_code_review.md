@@ -32,7 +32,8 @@
 1. 命名层已经拆到 `file_naming.rs`
 2. buffered writer 已拆到 `active_append.rs`
 3. plain/cache 主路径已经拆开
-4. 但 `AppendTargetCache` 与 `RuntimeState` 相关的状态流转仍然偏重
+4. `RuntimeState` / `AppendTargetCache` 已抽到独立的 `file_runtime.rs`
+5. 但 target-cache 状态机与 cache/log 路由本身仍然偏重
 
 因此当前 `mars-xlog-core` 在可维护性上的唯一主要剩余问题是：
 
