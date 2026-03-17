@@ -74,6 +74,18 @@ pub struct FileManager {
     _lock_files: Arc<Vec<File>>,
 }
 
+#[derive(Debug)]
+enum CacheAppendPlan {
+    AppendToPath {
+        path: PathBuf,
+        promote_after_append: bool,
+    },
+    PreferLogThenCache {
+        log_path: PathBuf,
+        cache_path: PathBuf,
+    },
+}
+
 impl FileManager {
     /// Creates a file manager for the given log and optional cache directories.
     pub fn new(
@@ -560,15 +572,54 @@ impl FileManager {
         keep_open: bool,
         durable: bool,
     ) -> Result<(), FileManagerError> {
+        match self.plan_cache_append(cache_dir, now, max_file_size, move_file, keep_open) {
+            CacheAppendPlan::AppendToPath {
+                path,
+                promote_after_append,
+            } => {
+                self.append_slices_with_runtime(&path, slices, now, keep_open, durable)?;
+                if promote_after_append {
+                    self.promote_cache_path_to_log(&path, now, max_file_size)?;
+                }
+                Ok(())
+            }
+            CacheAppendPlan::PreferLogThenCache {
+                log_path,
+                cache_path,
+            } => {
+                match self.append_slices_with_runtime(&log_path, slices, now, keep_open, durable) {
+                    Ok(()) => Ok(()),
+                    Err(_) => self.append_slices_with_runtime(
+                        &cache_path,
+                        slices,
+                        now,
+                        keep_open,
+                        durable,
+                    ),
+                }
+            }
+        }
+    }
+
+    fn plan_cache_append(
+        &self,
+        cache_dir: &Path,
+        now: chrono::DateTime<Local>,
+        max_file_size: u64,
+        move_file: bool,
+        keep_open: bool,
+    ) -> CacheAppendPlan {
         if let Some(log_path) = self.active_append_path(now, &self.log_dir, keep_open) {
-            return self.append_slices_with_runtime(&log_path, slices, now, keep_open, durable);
+            return CacheAppendPlan::AppendToPath {
+                path: log_path,
+                promote_after_append: false,
+            };
         }
         if let Some(cache_path) = self.active_append_path(now, cache_dir, keep_open) {
-            self.append_slices_with_runtime(&cache_path, slices, now, keep_open, durable)?;
-            if move_file && !self.should_cache_logs(now, max_file_size) {
-                self.promote_cache_path_to_log(&cache_path, now, max_file_size)?;
-            }
-            return Ok(());
+            return CacheAppendPlan::AppendToPath {
+                path: cache_path,
+                promote_after_append: move_file && !self.should_cache_logs(now, max_file_size),
+            };
         }
 
         let cache_path = self.select_append_path(now, cache_dir, &self.name_prefix, max_file_size);
@@ -578,18 +629,15 @@ impl FileManager {
             .unwrap_or_else(|| cache_path.exists());
 
         if cache_logs || cache_exists {
-            self.append_slices_with_runtime(&cache_path, slices, now, keep_open, durable)?;
-            if !cache_logs && move_file {
-                self.promote_cache_path_to_log(&cache_path, now, max_file_size)?;
-            }
-            return Ok(());
+            return CacheAppendPlan::AppendToPath {
+                path: cache_path,
+                promote_after_append: !cache_logs && move_file,
+            };
         }
 
-        let log_path =
-            self.select_append_path(now, &self.log_dir, &self.name_prefix, max_file_size);
-        match self.append_slices_with_runtime(&log_path, slices, now, keep_open, durable) {
-            Ok(()) => Ok(()),
-            Err(_) => self.append_slices_with_runtime(&cache_path, slices, now, keep_open, durable),
+        CacheAppendPlan::PreferLogThenCache {
+            log_path: self.select_append_path(now, &self.log_dir, &self.name_prefix, max_file_size),
+            cache_path,
         }
     }
 

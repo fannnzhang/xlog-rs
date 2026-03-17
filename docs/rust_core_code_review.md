@@ -25,7 +25,7 @@
 
 ## 唯一剩余问题
 
-`FileManager` 仍然把 append target cache、cache/log 路由、cache 提升/清理以及 runtime 状态协调耦合在同一个模块里。
+`FileManager` 仍然把 cache/log 生命周期策略与业务路由协调耦合在同一个模块里。
 
 更具体地说：
 
@@ -33,16 +33,16 @@
 2. buffered writer 已拆到 `active_append.rs`
 3. plain/cache 主路径已经拆开
 4. `RuntimeState` / `AppendTargetCache` 已抽到独立的 `file_runtime.rs`
-5. 但 target-cache 状态机与 cache/log 路由本身仍然偏重
+5. 但 cache 命中、cache 提升、log fallback 和文件生命周期策略仍由 `file_manager.rs` 统一决策
 
 因此当前 `mars-xlog-core` 在可维护性上的唯一主要剩余问题是：
 
-`FileManager` 的问题已经不再是 I/O 细节，而是 target-cache 状态机与 cache/log 路由协调仍过于耦合。
+`FileManager` 的问题已经不再是命名、writer 或状态机细节，而是 cache/log 生命周期策略与路由决策仍过于耦合。
 
 ## 后续方向
 
 下一步如果继续重构，应只围绕这一个问题展开：
 
 1. 继续收口 `AppendTargetCache` 相关辅助逻辑
-2. 继续压缩 `RuntimeState` 与 cache/log 路由的耦合
+2. 把 cache 命中 / promote / fallback 进一步收成显式策略边界
 3. 在拆分后补更细粒度的 `FileManager` 分层测试
