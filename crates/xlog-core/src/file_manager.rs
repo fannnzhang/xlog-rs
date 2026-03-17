@@ -286,85 +286,21 @@ impl FileManager {
             return Ok(());
         }
 
+        let now = Local::now();
         if self.cache_dir.is_none() {
-            let now = Local::now();
-            let mut runtime = self
-                .runtime
-                .lock()
-                .expect("file_manager runtime lock poisoned");
-            if keep_open
-                && self.try_append_active_plain_keep_open(
-                    &mut runtime,
-                    slices,
-                    now,
-                    max_file_size,
-                )?
-            {
-                return Ok(());
-            }
-            let path = self.select_append_path_locked(
-                &mut runtime,
-                now,
-                &self.log_dir,
-                &self.name_prefix,
-                max_file_size,
-                keep_open,
-            );
-            return self.append_slices_with_runtime_locked(
-                &mut runtime,
-                &path,
-                slices,
-                now,
-                keep_open,
-                durable,
-            );
+            return self.append_log_slices_plain(slices, now, max_file_size, keep_open, durable);
         }
 
         let cache_dir = self.cache_dir.as_ref().expect("cache_dir is_some");
-        let now = Local::now();
-        if let Some(log_path) = self.active_append_path(now, &self.log_dir, keep_open) {
-            return self.append_slices_with_runtime(&log_path, slices, now, keep_open, durable);
-        }
-        if let Some(cache_path) = self.active_append_path(now, cache_dir, keep_open) {
-            self.append_slices_with_runtime(&cache_path, slices, now, keep_open, durable)?;
-            if move_file && !self.should_cache_logs(now, max_file_size) {
-                let log_path =
-                    self.select_append_path(now, &self.log_dir, &self.name_prefix, max_file_size);
-                append_file_to_file(&cache_path, &log_path)?;
-                fs::remove_file(&cache_path)
-                    .map_err(|e| FileManagerError::RemoveFile(cache_path.clone(), e))?;
-                self.mark_cached_path_removed(&cache_path);
-            }
-            return Ok(());
-        }
-
-        let cache_path = self.select_append_path(now, cache_dir, &self.name_prefix, max_file_size);
-        let cache_logs = self.should_cache_logs(now, max_file_size);
-        let cache_exists = self
-            .cached_local_exists(now, cache_dir, max_file_size)
-            .unwrap_or_else(|| cache_path.exists());
-
-        if cache_logs || cache_exists {
-            self.append_slices_with_runtime(&cache_path, slices, now, keep_open, durable)?;
-            if cache_logs || !move_file {
-                return Ok(());
-            }
-
-            let log_path =
-                self.select_append_path(now, &self.log_dir, &self.name_prefix, max_file_size);
-            append_file_to_file(&cache_path, &log_path)?;
-            fs::remove_file(&cache_path)
-                .map_err(|e| FileManagerError::RemoveFile(cache_path.clone(), e))?;
-            self.mark_cached_path_removed(&cache_path);
-            return Ok(());
-        }
-
-        let log_path =
-            self.select_append_path(now, &self.log_dir, &self.name_prefix, max_file_size);
-        match self.append_slices_with_runtime(&log_path, slices, now, keep_open, durable) {
-            Ok(()) => Ok(()),
-            Err(_) => self.append_slices_with_runtime(&cache_path, slices, now, keep_open, durable),
-        }
+        self.append_log_slices_with_cache(
+            cache_dir,
+            slices,
+            now,
+            max_file_size,
+            move_file,
+            keep_open,
+            durable,
+        )
     }
 
     /// Moves eligible cache files into the primary log directory.
@@ -801,6 +737,93 @@ impl FileManager {
             .lock()
             .expect("file_manager runtime lock poisoned");
         self.append_slices_with_runtime_locked(&mut runtime, path, slices, now, keep_open, durable)
+    }
+
+    fn append_log_slices_plain(
+        &self,
+        slices: &[&[u8]],
+        now: chrono::DateTime<Local>,
+        max_file_size: u64,
+        keep_open: bool,
+        durable: bool,
+    ) -> Result<(), FileManagerError> {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .expect("file_manager runtime lock poisoned");
+        if keep_open
+            && self.try_append_active_plain_keep_open(&mut runtime, slices, now, max_file_size)?
+        {
+            return Ok(());
+        }
+        let path = self.select_append_path_locked(
+            &mut runtime,
+            now,
+            &self.log_dir,
+            &self.name_prefix,
+            max_file_size,
+            keep_open,
+        );
+        self.append_slices_with_runtime_locked(&mut runtime, &path, slices, now, keep_open, durable)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_log_slices_with_cache(
+        &self,
+        cache_dir: &Path,
+        slices: &[&[u8]],
+        now: chrono::DateTime<Local>,
+        max_file_size: u64,
+        move_file: bool,
+        keep_open: bool,
+        durable: bool,
+    ) -> Result<(), FileManagerError> {
+        if let Some(log_path) = self.active_append_path(now, &self.log_dir, keep_open) {
+            return self.append_slices_with_runtime(&log_path, slices, now, keep_open, durable);
+        }
+        if let Some(cache_path) = self.active_append_path(now, cache_dir, keep_open) {
+            self.append_slices_with_runtime(&cache_path, slices, now, keep_open, durable)?;
+            if move_file && !self.should_cache_logs(now, max_file_size) {
+                self.promote_cache_path_to_log(&cache_path, now, max_file_size)?;
+            }
+            return Ok(());
+        }
+
+        let cache_path = self.select_append_path(now, cache_dir, &self.name_prefix, max_file_size);
+        let cache_logs = self.should_cache_logs(now, max_file_size);
+        let cache_exists = self
+            .cached_local_exists(now, cache_dir, max_file_size)
+            .unwrap_or_else(|| cache_path.exists());
+
+        if cache_logs || cache_exists {
+            self.append_slices_with_runtime(&cache_path, slices, now, keep_open, durable)?;
+            if !cache_logs && move_file {
+                self.promote_cache_path_to_log(&cache_path, now, max_file_size)?;
+            }
+            return Ok(());
+        }
+
+        let log_path =
+            self.select_append_path(now, &self.log_dir, &self.name_prefix, max_file_size);
+        match self.append_slices_with_runtime(&log_path, slices, now, keep_open, durable) {
+            Ok(()) => Ok(()),
+            Err(_) => self.append_slices_with_runtime(&cache_path, slices, now, keep_open, durable),
+        }
+    }
+
+    fn promote_cache_path_to_log(
+        &self,
+        cache_path: &Path,
+        now: chrono::DateTime<Local>,
+        max_file_size: u64,
+    ) -> Result<(), FileManagerError> {
+        let log_path =
+            self.select_append_path(now, &self.log_dir, &self.name_prefix, max_file_size);
+        append_file_to_file(cache_path, &log_path)?;
+        fs::remove_file(cache_path)
+            .map_err(|e| FileManagerError::RemoveFile(cache_path.to_path_buf(), e))?;
+        self.mark_cached_path_removed(cache_path);
+        Ok(())
     }
 
     fn select_append_path_locked(

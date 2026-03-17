@@ -47,6 +47,7 @@
 8. `async_buffer_stats` / `async_buffer_snapshot`、`FileManager` 部分 runtime 访问、`InstanceRegistry` 查询改为 poison fast-fail
 9. `file_manager.rs` 的路径/日期命名辅助逻辑已抽到 `file_naming.rs`
 10. `ZlibStreamCompressor` / `ZstdStreamCompressor` 每次发射后都会清理内部输出缓冲，不再保留整块 pending block 已发射字节
+11. `append_log_slices_inner` 已拆成 plain-path / cache-path 两条私有路径，并把 cache→log 提升提成独立 helper
 
 ### 1.3 补测试
 
@@ -74,9 +75,9 @@
 
 建议后续拆分方向：
 
-1. path/date resolver
-2. active append writer
-3. cache/log append routing
+1. active append writer
+2. 更细粒度的 cache/log append routing
+3. 清理剩余的内部状态/缓存辅助逻辑
 
 ### 2.2 ConsoleLevel 与 LogLevel 仍是两套枚举
 
