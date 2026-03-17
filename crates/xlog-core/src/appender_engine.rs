@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -9,19 +9,13 @@ use crate::metrics::{
     record_engine_timeout_flush, record_engine_write_block,
 };
 
-use chrono::{Local, Timelike};
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
 use thiserror::Error;
 
 use crate::buffer::{validate_block, BufferError, PersistentBuffer};
 use crate::file_manager::{FileManager, FileManagerError};
-use crate::platform_tid::current_tid;
-use crate::protocol::{
-    select_magic, AppendMode, CompressionKind, LogHeader, HEADER_LEN,
-    MAGIC_ASYNC_NO_CRYPT_ZLIB_START, MAGIC_ASYNC_NO_CRYPT_ZSTD_START, MAGIC_ASYNC_ZLIB_START,
-    MAGIC_ASYNC_ZSTD_START, MAGIC_END, MAGIC_SYNC_NO_CRYPT_ZLIB_START,
-    MAGIC_SYNC_NO_CRYPT_ZSTD_START, MAGIC_SYNC_ZLIB_START, MAGIC_SYNC_ZSTD_START,
-};
+use crate::protocol::{LogHeader, HEADER_LEN, MAGIC_END};
+use crate::recovery::{build_sync_tip_block, current_mark_info};
 
 const DEFAULT_ASYNC_FLUSH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const ASYNC_PENDING_MMAP_PERSIST_EVERY_UPDATES: u32 = 64;
@@ -35,6 +29,7 @@ const EXPIRED_SWEEP_INTERVAL: Duration = Duration::from_secs(2 * 60);
 const CACHE_MOVE_INTERVAL: Duration = Duration::from_secs(3 * 60);
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(u8)]
 /// Runtime mode used by [`AppenderEngine`].
 pub enum EngineMode {
     /// Buffer blocks in mmap/cache state and let the worker flush them later.
@@ -44,6 +39,7 @@ pub enum EngineMode {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(u8)]
 /// Reason attached to an async flush request or observed flush epoch.
 pub enum AsyncFlushReason {
     /// No concrete reason was recorded.
@@ -104,7 +100,7 @@ enum EngineCommand {
 /// The engine owns the mmap-backed async buffer, the active file manager, and
 /// the worker thread that drains async state into `.xlog` files.
 pub struct AppenderEngine {
-    mode: AtomicI32,
+    mode: AtomicU8,
     file_manager: FileManager,
     state: Arc<Mutex<EngineState>>,
     buffer_capacity: usize,
@@ -199,7 +195,7 @@ impl AppenderEngine {
             .expect("spawn appender engine thread");
 
         Self {
-            mode: AtomicI32::new(mode_to_i32(mode)),
+            mode: AtomicU8::new(mode as u8),
             file_manager,
             state,
             buffer_capacity,
@@ -216,7 +212,7 @@ impl AppenderEngine {
 
     /// Return the current engine mode.
     pub fn mode(&self) -> EngineMode {
-        i32_to_mode(self.mode.load(Ordering::Relaxed))
+        engine_mode_from_u8(self.mode.load(Ordering::Relaxed))
     }
 
     /// Switch the engine between async and sync modes.
@@ -224,7 +220,7 @@ impl AppenderEngine {
     /// Switching from async to sync forces a synchronous drain first so the
     /// caller does not leave buffered async data behind.
     pub fn set_mode(&self, mode: EngineMode) -> Result<(), AppenderEngineError> {
-        let old = i32_to_mode(self.mode.swap(mode_to_i32(mode), Ordering::Relaxed));
+        let old = engine_mode_from_u8(self.mode.swap(mode as u8, Ordering::Relaxed));
         if old == EngineMode::Async && mode == EngineMode::Sync {
             self.request_flush(true, true, AsyncFlushReason::Explicit)?;
         }
@@ -240,9 +236,8 @@ impl AppenderEngine {
     /// Update the max logfile size used by subsequent appends and rotations.
     pub fn set_max_file_size(&self, max_file_size: u64) {
         self.max_file_size.store(max_file_size, Ordering::Relaxed);
-        if let Ok(mut state) = self.state.lock() {
-            state.max_file_size = max_file_size;
-        }
+        let mut state = self.state.lock().expect("state lock poisoned");
+        state.max_file_size = max_file_size;
     }
 
     /// Update the max logfile age, ignoring values below the built-in minimum.
@@ -251,9 +246,8 @@ impl AppenderEngine {
             return;
         }
         self.max_alive_time.store(alive_seconds, Ordering::Relaxed);
-        if let Ok(mut state) = self.state.lock() {
-            state.max_alive_time = alive_seconds;
-        }
+        let mut state = self.state.lock().expect("state lock poisoned");
+        state.max_alive_time = alive_seconds;
     }
 
     /// Return the current max logfile size.
@@ -483,10 +477,8 @@ impl AppenderEngine {
         if self.mode() != EngineMode::Async {
             return None;
         }
-        self.state
-            .lock()
-            .ok()
-            .map(|s| (s.buffer.len(), s.buffer.capacity()))
+        let state = self.state.lock().expect("state lock poisoned");
+        Some((state.buffer.len(), state.buffer.capacity()))
     }
 
     /// Snapshot the current async buffer contents, or `None` in sync mode.
@@ -494,7 +486,14 @@ impl AppenderEngine {
         if self.mode() != EngineMode::Async {
             return None;
         }
-        self.state.lock().ok().map(|s| s.buffer.as_bytes().to_vec())
+        Some(
+            self.state
+                .lock()
+                .expect("state lock poisoned")
+                .buffer
+                .as_bytes()
+                .to_vec(),
+        )
     }
 
     /// Return the fixed capacity of the backing async buffer.
@@ -896,81 +895,23 @@ fn maybe_housekeep_locked(state: &mut EngineState, force: bool) -> Result<(), Ap
     Ok(())
 }
 
-fn mode_to_i32(mode: EngineMode) -> i32 {
-    match mode {
-        EngineMode::Async => 0,
-        EngineMode::Sync => 1,
+fn engine_mode_from_u8(v: u8) -> EngineMode {
+    match v {
+        x if x == EngineMode::Sync as u8 => EngineMode::Sync,
+        _ => EngineMode::Async,
     }
-}
-
-fn i32_to_mode(v: i32) -> EngineMode {
-    if v == 1 {
-        EngineMode::Sync
-    } else {
-        EngineMode::Async
-    }
-}
-
-fn magic_profile(magic: u8) -> Option<(CompressionKind, bool)> {
-    match magic {
-        MAGIC_SYNC_ZLIB_START | MAGIC_ASYNC_ZLIB_START => Some((CompressionKind::Zlib, true)),
-        MAGIC_SYNC_NO_CRYPT_ZLIB_START | MAGIC_ASYNC_NO_CRYPT_ZLIB_START => {
-            Some((CompressionKind::Zlib, false))
-        }
-        MAGIC_SYNC_ZSTD_START | MAGIC_ASYNC_ZSTD_START => Some((CompressionKind::Zstd, true)),
-        MAGIC_SYNC_NO_CRYPT_ZSTD_START | MAGIC_ASYNC_NO_CRYPT_ZSTD_START => {
-            Some((CompressionKind::Zstd, false))
-        }
-        _ => None,
-    }
-}
-
-fn build_sync_tip_block(sample_header: Option<LogHeader>, tip: &str) -> Option<Vec<u8>> {
-    let sample = sample_header?;
-    let (compression, crypt) = magic_profile(sample.magic)?;
-    let payload = tip.as_bytes();
-    let now_hour = Local::now().hour() as u8;
-    let header = LogHeader {
-        magic: select_magic(compression, AppendMode::Sync, crypt),
-        seq: 0,
-        begin_hour: now_hour,
-        end_hour: now_hour,
-        len: u32::try_from(payload.len()).ok()?,
-        client_pubkey: if crypt { sample.client_pubkey } else { [0; 64] },
-    };
-    let mut out = Vec::with_capacity(HEADER_LEN + payload.len() + 1);
-    out.extend_from_slice(&header.encode());
-    out.extend_from_slice(payload);
-    out.push(MAGIC_END);
-    Some(out)
-}
-
-fn current_mark_info() -> String {
-    let now = Local::now();
-    format!(
-        "[{},{}][{}]",
-        std::process::id(),
-        current_tid(),
-        now.format("%Y-%m-%d %z %H:%M:%S")
-    )
 }
 
 fn async_flush_reason_to_u8(reason: AsyncFlushReason) -> u8 {
-    match reason {
-        AsyncFlushReason::Unknown => 0,
-        AsyncFlushReason::Threshold => 1,
-        AsyncFlushReason::Explicit => 2,
-        AsyncFlushReason::Timeout => 3,
-        AsyncFlushReason::Stop => 4,
-    }
+    reason as u8
 }
 
 fn u8_to_async_flush_reason(value: u8) -> AsyncFlushReason {
     match value {
-        1 => AsyncFlushReason::Threshold,
-        2 => AsyncFlushReason::Explicit,
-        3 => AsyncFlushReason::Timeout,
-        4 => AsyncFlushReason::Stop,
+        x if x == AsyncFlushReason::Threshold as u8 => AsyncFlushReason::Threshold,
+        x if x == AsyncFlushReason::Explicit as u8 => AsyncFlushReason::Explicit,
+        x if x == AsyncFlushReason::Timeout as u8 => AsyncFlushReason::Timeout,
+        x if x == AsyncFlushReason::Stop as u8 => AsyncFlushReason::Stop,
         _ => AsyncFlushReason::Unknown,
     }
 }
@@ -988,19 +929,16 @@ fn async_flush_reason_label(reason: AsyncFlushReason) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        async_buffer_flush_threshold, async_flush_reason_to_u8, build_sync_tip_block, i32_to_mode,
-        mode_to_i32, u8_to_async_flush_reason, AsyncFlushReason, EngineMode,
-    };
-    use crate::protocol::{
-        select_magic, AppendMode, CompressionKind, LogHeader, HEADER_LEN, MAGIC_END,
+        async_buffer_flush_threshold, async_flush_reason_to_u8, engine_mode_from_u8,
+        u8_to_async_flush_reason, AsyncFlushReason, EngineMode,
     };
 
     #[test]
     fn mode_and_async_flush_reason_roundtrip() {
         for mode in [EngineMode::Async, EngineMode::Sync] {
-            assert_eq!(i32_to_mode(mode_to_i32(mode)), mode);
+            assert_eq!(engine_mode_from_u8(mode as u8), mode);
         }
-        assert_eq!(i32_to_mode(99), EngineMode::Async);
+        assert_eq!(engine_mode_from_u8(99), EngineMode::Async);
 
         for reason in [
             AsyncFlushReason::Unknown,
@@ -1022,55 +960,5 @@ mod tests {
         assert_eq!(async_buffer_flush_threshold(0), 1);
         assert_eq!(async_buffer_flush_threshold(1), 1);
         assert_eq!(async_buffer_flush_threshold(9), 3);
-    }
-
-    #[test]
-    fn build_sync_tip_block_preserves_crypto_profile() {
-        let mut pubkey = [0u8; 64];
-        for (idx, byte) in pubkey.iter_mut().enumerate() {
-            *byte = idx as u8;
-        }
-
-        let crypt_block = build_sync_tip_block(
-            Some(LogHeader {
-                magic: select_magic(CompressionKind::Zstd, AppendMode::Async, true),
-                seq: 7,
-                begin_hour: 1,
-                end_hour: 1,
-                len: 0,
-                client_pubkey: pubkey,
-            }),
-            "tip",
-        )
-        .unwrap();
-        let crypt_header = LogHeader::decode(&crypt_block[..HEADER_LEN]).unwrap();
-        assert_eq!(
-            crypt_header.magic,
-            select_magic(CompressionKind::Zstd, AppendMode::Sync, true)
-        );
-        assert_eq!(crypt_header.client_pubkey, pubkey);
-        assert_eq!(&crypt_block[HEADER_LEN..HEADER_LEN + 3], b"tip");
-        assert_eq!(crypt_block.last().copied(), Some(MAGIC_END));
-
-        let plain_block = build_sync_tip_block(
-            Some(LogHeader {
-                magic: select_magic(CompressionKind::Zlib, AppendMode::Async, false),
-                seq: 9,
-                begin_hour: 2,
-                end_hour: 2,
-                len: 0,
-                client_pubkey: pubkey,
-            }),
-            "tip",
-        )
-        .unwrap();
-        let plain_header = LogHeader::decode(&plain_block[..HEADER_LEN]).unwrap();
-        assert_eq!(
-            plain_header.magic,
-            select_magic(CompressionKind::Zlib, AppendMode::Sync, false)
-        );
-        assert_eq!(plain_header.client_pubkey, [0; 64]);
-
-        assert!(build_sync_tip_block(None, "tip").is_none());
     }
 }

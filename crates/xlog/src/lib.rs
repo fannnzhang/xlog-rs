@@ -166,6 +166,10 @@ pub enum XlogError {
 }
 
 /// Configuration used to create an Xlog instance or open the global appender.
+///
+/// A given `(name_prefix, log_dir/cache_dir)` namespace is single-writer only.
+/// Initialization enforces this with `<name_prefix>.lock` files in each
+/// storage directory involved in the instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XlogConfig {
     /// Directory for log files. Must be non-empty.
@@ -175,6 +179,9 @@ pub struct XlogConfig {
     /// Optional public key (hex string, 128 chars) enabling log encryption.
     pub pub_key: Option<String>,
     /// Optional cache directory for mmap buffers and temporary logs.
+    ///
+    /// When set, it participates in the same single-writer lock namespace as
+    /// `log_dir`.
     pub cache_dir: Option<String>,
     /// Days to keep cached logs before moving them to `log_dir`.
     pub cache_days: i32,

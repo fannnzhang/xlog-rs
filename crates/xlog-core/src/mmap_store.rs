@@ -128,8 +128,13 @@ fn open_rw_file(path: &Path) -> Result<File, MmapStoreError> {
 fn preallocate_by_zero_write(file: &mut File, capacity: usize) -> std::io::Result<()> {
     // Match Mars behavior: explicitly write zeroes to back storage to avoid sparse-file SIGBUS.
     file.seek(SeekFrom::Start(0))?;
-    let zeros = vec![0u8; capacity];
-    file.write_all(&zeros)?;
+    let zeros = [0u8; 64 * 1024];
+    let mut remaining = capacity;
+    while remaining > 0 {
+        let chunk_len = remaining.min(zeros.len());
+        file.write_all(&zeros[..chunk_len])?;
+        remaining -= chunk_len;
+    }
     file.flush()?;
     Ok(())
 }

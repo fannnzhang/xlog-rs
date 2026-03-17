@@ -5,6 +5,7 @@
 //! they are intentionally composing lower-level buffer, protocol, or appender
 //! primitives.
 
+mod active_append;
 /// Append engine, flush control, and async pending-block primitives.
 pub mod appender_engine;
 /// Persistent mmap-backed buffer and recovery helpers.
@@ -15,8 +16,14 @@ pub mod compress;
 pub mod crypto;
 /// Human-readable dump utilities for log buffers.
 pub mod dump;
+mod file_maintenance;
 /// File lifecycle, cache movement, and active log append helpers.
 pub mod file_manager;
+mod file_naming;
+mod file_ops;
+mod file_policy;
+mod file_runtime;
+mod file_target;
 /// Line formatter used by the Rust runtime path.
 pub mod formatter;
 mod metrics;
@@ -32,5 +39,6 @@ pub mod platform_tid;
 pub mod protocol;
 /// Log record model used by formatter and runtime paths.
 pub mod record;
+mod recovery;
 /// Instance registry helpers.
 pub mod registry;

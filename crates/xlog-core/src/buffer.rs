@@ -4,7 +4,9 @@ use thiserror::Error;
 
 use crate::metrics::record_recovery_scan;
 use crate::mmap_store::{MmapStore, MmapStoreError};
-use crate::protocol::{update_end_hour_in_place, LogHeader, HEADER_LEN, MAGIC_END};
+use crate::protocol::{
+    update_end_hour_in_place, LogHeader, HEADER_LEN, HEADER_LEN_OFFSET, MAGIC_END,
+};
 
 /// Default mmap buffer size used by the async write path.
 pub const DEFAULT_BUFFER_BLOCK_LEN: usize = 150 * 1024;
@@ -312,7 +314,8 @@ impl PersistentBuffer {
             }
             let payload_len =
                 u32::try_from(next_len - HEADER_LEN).map_err(|_| BufferError::BlockLenOverflow)?;
-            data[5..9].copy_from_slice(&payload_len.to_le_bytes());
+            data[HEADER_LEN_OFFSET..HEADER_LEN_OFFSET + 4]
+                .copy_from_slice(&payload_len.to_le_bytes());
             update_end_hour_in_place(&mut data[..HEADER_LEN], end_hour)
                 .map_err(|_| BufferError::InvalidBlock)?;
             self.len = next_len;

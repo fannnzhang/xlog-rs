@@ -30,25 +30,7 @@ use crate::formatter::extract_file_name;
     target_os = "watchos"
 ))]
 use crate::platform_tid::{current_tid, main_tid};
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-/// Severity used for platform console forwarding.
-pub enum ConsoleLevel {
-    /// Verbose diagnostic output.
-    Verbose,
-    /// Debug output for development and troubleshooting.
-    Debug,
-    /// Informational output for normal events.
-    Info,
-    /// Warning output for recoverable issues.
-    Warn,
-    /// Error output for failures that do not immediately abort the process.
-    Error,
-    /// Fatal output for unrecoverable failures.
-    Fatal,
-    /// Console forwarding disabled.
-    None,
-}
+use crate::record::LogLevel;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 /// Apple console sink selection used by [`set_apple_console_fun`].
@@ -95,7 +77,7 @@ pub fn set_apple_console_fun(_fun: AppleConsoleFun) {}
 /// targets use the configured [`AppleConsoleFun`], and other targets print to
 /// stdout.
 pub fn write_console_line(
-    level: ConsoleLevel,
+    level: LogLevel,
     tag: &str,
     file: &str,
     func: &str,
@@ -143,15 +125,7 @@ pub fn write_console_line(
                 return;
             }
             if mode == AppleConsoleFun::NsLog as u8 {
-                let text = format!(
-                    "[{}][{}][{}:{}, {}][{}",
-                    level_short(level),
-                    tag,
-                    file_name,
-                    line,
-                    func_name,
-                    msg
-                );
+                let text = format_basic_console_line(level, tag, file_name, func_name, line, msg);
                 let c_line = to_console_cstring(&text);
                 unsafe {
                     xlog_core_apple_console_nslog(c_line.as_ptr());
@@ -190,28 +164,34 @@ pub fn write_console_line(
         )))]
         {
             eprintln!(
-                "[{}][{}][{}:{}, {}][{}",
-                level_short(level),
-                tag,
-                file_name,
-                line,
-                func_name,
-                msg
+                "{}",
+                format_basic_console_line(level, tag, file_name, func_name, line, msg)
             );
         }
     }
 }
 
-fn level_short(level: ConsoleLevel) -> &'static str {
-    match level {
-        ConsoleLevel::Verbose => "V",
-        ConsoleLevel::Debug => "D",
-        ConsoleLevel::Info => "I",
-        ConsoleLevel::Warn => "W",
-        ConsoleLevel::Error => "E",
-        ConsoleLevel::Fatal => "F",
-        ConsoleLevel::None => "N",
-    }
+fn level_short(level: LogLevel) -> &'static str {
+    level.short()
+}
+
+fn format_basic_console_line(
+    level: LogLevel,
+    tag: &str,
+    file_name: &str,
+    func_name: &str,
+    line: u32,
+    msg: &str,
+) -> String {
+    format!(
+        "[{}][{}][{}:{}, {}][{}",
+        level_short(level),
+        tag,
+        file_name,
+        line,
+        func_name,
+        msg
+    )
 }
 
 #[cfg(any(
@@ -235,27 +215,20 @@ fn to_console_cstring(s: &str) -> CString {
     target_os = "tvos",
     target_os = "watchos"
 ))]
-fn apple_level(level: ConsoleLevel) -> i32 {
+fn apple_level(level: LogLevel) -> i32 {
     match level {
-        ConsoleLevel::Verbose => 0,
-        ConsoleLevel::Debug => 1,
-        ConsoleLevel::Info => 2,
-        ConsoleLevel::Warn => 3,
-        ConsoleLevel::Error => 4,
-        ConsoleLevel::Fatal => 5,
-        ConsoleLevel::None => 6,
+        LogLevel::Verbose => 0,
+        LogLevel::Debug => 1,
+        LogLevel::Info => 2,
+        LogLevel::Warn => 3,
+        LogLevel::Error => 4,
+        LogLevel::Fatal => 5,
+        LogLevel::None => 6,
     }
 }
 
 #[cfg(target_os = "android")]
-fn write_android_line(
-    level: ConsoleLevel,
-    tag: &str,
-    file: &str,
-    func: &str,
-    line: u32,
-    msg: &str,
-) {
+fn write_android_line(level: LogLevel, tag: &str, file: &str, func: &str, line: u32, msg: &str) {
     let file_name = extract_file_name(file);
     let func_name = if func.is_empty() { "" } else { func };
     let mut out = format!("[{file_name}:{line}, {func_name}]:{msg}");
@@ -270,15 +243,15 @@ fn write_android_line(
 }
 
 #[cfg(target_os = "android")]
-fn android_priority(level: ConsoleLevel) -> i32 {
+fn android_priority(level: LogLevel) -> i32 {
     match level {
-        ConsoleLevel::Verbose => 2, // ANDROID_LOG_VERBOSE
-        ConsoleLevel::Debug => 3,   // ANDROID_LOG_DEBUG
-        ConsoleLevel::Info => 4,    // ANDROID_LOG_INFO
-        ConsoleLevel::Warn => 5,    // ANDROID_LOG_WARN
-        ConsoleLevel::Error => 6,   // ANDROID_LOG_ERROR
-        ConsoleLevel::Fatal => 7,   // ANDROID_LOG_FATAL
-        ConsoleLevel::None => 4,    // ANDROID_LOG_INFO
+        LogLevel::Verbose => 2, // ANDROID_LOG_VERBOSE
+        LogLevel::Debug => 3,   // ANDROID_LOG_DEBUG
+        LogLevel::Info => 4,    // ANDROID_LOG_INFO
+        LogLevel::Warn => 5,    // ANDROID_LOG_WARN
+        LogLevel::Error => 6,   // ANDROID_LOG_ERROR
+        LogLevel::Fatal => 7,   // ANDROID_LOG_FATAL
+        LogLevel::None => 4,    // ANDROID_LOG_INFO
     }
 }
 
@@ -304,4 +277,23 @@ unsafe extern "C" {
         func: *const libc::c_char,
         msg: *const libc::c_char,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_basic_console_line;
+    use crate::record::LogLevel;
+
+    #[test]
+    fn format_basic_console_line_matches_stderr_layout() {
+        let line =
+            format_basic_console_line(LogLevel::Warn, "core", "main.rs", "write", 42, "hello");
+        assert_eq!(line, "[W][core][main.rs:42, write][hello");
+    }
+
+    #[test]
+    fn format_basic_console_line_keeps_empty_func_slot() {
+        let line = format_basic_console_line(LogLevel::Info, "core", "main.rs", "", 7, "msg");
+        assert_eq!(line, "[I][core][main.rs:7, ][msg");
+    }
 }
